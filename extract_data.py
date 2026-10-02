@@ -408,11 +408,16 @@ def locate_and_crop_performance_chart(pdf_path, workdir, dpi=CHART_CROP_DPI):
          "-l", str(page_index + 1), pdf_path, png_prefix],
         check=True, capture_output=True,
     )
-    # pdftoppm names single-page output "<prefix>-<page>.png" (or
-    # "<prefix>.png" for some versions when only one page is requested).
-    candidates = [f"{png_prefix}-{page_index + 1}.png", f"{png_prefix}.png",
-                  f"{png_prefix}-01.png"]
-    full_png = next((p for p in candidates if os.path.exists(p)), None)
+    # pdftoppm's single-page output filename varies by version/platform --
+    # it may be "<prefix>.png", "<prefix>-<page>.png" with no padding, or
+    # "<prefix>-<page>.png" zero-padded to the digit width of the *last*
+    # page number requested (e.g. "-08" vs "-8" vs "-23"), and the padding
+    # width isn't reliably predictable from page_index alone. Rather than
+    # guess every exact filename, glob for whatever got written next to the
+    # prefix -- there's only ever one PNG for a single requested page.
+    import glob
+    matches = sorted(glob.glob(f"{png_prefix}*.png"))
+    full_png = matches[0] if matches else None
     if full_png is None:
         warnings.append("Could not render the candidate chart page.")
         return None, warnings
