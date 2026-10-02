@@ -361,31 +361,55 @@ def _find_candidate_chart_page(pdf):
     return _find_section_page(pdf, "Performance")
 
 
-def _scan_navy_bars(png_path):
-    """Returns (bars, img_h_px, img_w_px). `bars` is a list of (start_row,
-    end_row) pixel ranges where a horizontal band of the image is mostly
-    the navy section-header color."""
-    import numpy as np
-    from PIL import Image
+SCAN_MAX_DIM = 900  # longest side, in px, of the downsampled copy used for
+                     # bar-detection math -- keeps the numpy work cheap on a
+                     # memory-constrained host regardless of render DPI.
 
-    im = Image.open(png_path).convert("RGB")
-    arr = np.array(im)
-    h, w, _ = arr.shape
-    target = np.array(NAVY_RGB)
-    close = (np.abs(arr.astype(int) - target) <= NAVY_TOL).all(axis=2)
+
+def _scan_navy_bars(im):
+    """Returns (bars, img_h_px, img_w_px) in `im`'s own (full-resolution)
+    pixel coordinates. `bars` is a list of (start_row, end_row) pixel ranges
+    where a horizontal band of the image is mostly the navy section-header
+    color.
+
+    `im` is the already-opened, full-resolution PIL Image (never re-opened
+    here, so only one decoded copy of the page ever exists in memory at
+    once). The color-matching math itself runs on a small downsampled copy
+    -- a full-resolution 300dpi page upcast for a signed color-difference
+    comparison can easily be 150-200MB+ for one temporary array, which is
+    enough on its own to exceed a memory-constrained host's limit. Detected
+    row ranges are scaled back up to the caller's full-resolution coordinate
+    space before returning, so the crop itself still uses the real pixels."""
+    import numpy as np
+
+    img_w, img_h = im.size
+    scale = min(1.0, SCAN_MAX_DIM / max(img_w, img_h))
+    small = im.resize((max(1, round(img_w * scale)), max(1, round(img_h * scale)))) if scale < 1.0 else im
+
+    # int16 is plenty for a signed RGB difference (range -255..255) and is
+    # a quarter the size of numpy's default platform int (int64).
+    arr = np.asarray(small, dtype=np.int16)
+    target = np.array(NAVY_RGB, dtype=np.int16)
+    close = (np.abs(arr - target) <= NAVY_TOL).all(axis=2)
     row_frac = close.mean(axis=1)
     bar_rows = np.where(row_frac > 0.5)[0]
 
-    bars = []
+    bars_small = []
     if len(bar_rows):
         start = prev = bar_rows[0]
         for r in bar_rows[1:]:
             if r - prev > 3:
-                bars.append((start, prev))
+                bars_small.append((start, prev))
                 start = r
             prev = r
-        bars.append((start, prev))
-    return bars, h, w
+        bars_small.append((start, prev))
+
+    if scale < 1.0:
+        inv_scale = img_h / small.size[1]
+        bars = [(int(s * inv_scale), int(e * inv_scale) + 1) for s, e in bars_small]
+    else:
+        bars = bars_small
+    return bars, img_h, img_w
 
 
 def locate_and_crop_performance_chart(pdf_path, workdir, dpi=CHART_CROP_DPI):
@@ -426,7 +450,7 @@ def locate_and_crop_performance_chart(pdf_path, workdir, dpi=CHART_CROP_DPI):
     im = Image.open(full_png).convert("RGB")
     img_w, img_h = im.size
 
-    bars, _, _ = _scan_navy_bars(full_png)
+    bars, _, _ = _scan_navy_bars(im)
     out_png = os.path.join(workdir, "performance_chart.png")
 
     if not bars:
