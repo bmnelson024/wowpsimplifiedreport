@@ -13,15 +13,14 @@ This is a server-side port of the `white-oak-simplified-review` skill's
 extract_data.py. The extraction logic below (money/pct parsing, the Orion
 quirk workarounds, holdings/gain-loss/benchmark extraction) is reproduced
 verbatim from the verified skill. The one addition is
-`locate_performance_chart()`, which automates what the skill previously did
-by hand each time (rendering a candidate page and visually measuring the
-chart's crop box) -- see its docstring for the method and its limits.
+`locate_and_crop_performance_chart()`, which automates what the skill
+previously did by hand each time (rendering a candidate page and visually
+measuring the chart's crop box) -- see its docstring for the method and
+its limits.
 """
 import os
 import re
 import subprocess
-import tempfile
-from copy import deepcopy
 
 import pdfplumber
 
@@ -322,17 +321,30 @@ def extract_benchmark_legend(pdf, client_name):
 #      the next header bar on the same page, or the page bottom if none is
 #      found.
 #
-# This is a best-effort automation of a step the skill explicitly flags as
-# needing a human visual check per client (page layouts vary). It has not
-# been validated against a real Orion export in this environment (none was
-# available) -- run it against at least one real client PDF and spot-check
-# the resulting page 3 chart before trusting it broadly, even though the
-# web service itself does not gate delivery on that check.
+# IMPORTANT: an earlier version of this did the bar-row scan on a rendered
+# PNG (pixel space) but then converted those pixel rows to PDF points and
+# applied them as a pypdf crop box in the *source page's own coordinate
+# space*. That mixes two different frames whenever the page has a /Rotate
+# transform (common for a landscape chart embedded in an otherwise-portrait
+# export): pdftoppm renders the page as a human sees it (rotation applied),
+# but pypdf's cropbox/mediabox operate on the page's raw, pre-rotation
+# coordinates -- so a crop box measured from the rendered image landed in
+# the wrong place on the raw page, pulling in the page's own running header
+# above the chart and a chunk of the next table below it. Confirmed against
+# a real client export (McSwain) where the auto-generated report's page 3
+# included "Client Review - White Oak / Page 8 of 23" above the chart and a
+# "Performance Summary" holdings table below it -- exactly this failure
+# mode.
+#
+# Fixed by never leaving pixel space: the candidate page is rendered once,
+# the navy bars are found in that same image, and the chart is cropped
+# directly out of that same PNG with PIL -- no PDF-point conversion, no
+# pypdf cropbox, so page rotation can't introduce a mismatch.
 # ---------------------------------------------------------------------------
 
 NAVY_RGB = (1, 69, 107)
 NAVY_TOL = 45
-DETECT_DPI = 150
+CHART_CROP_DPI = 300
 
 
 def _find_candidate_chart_page(pdf):
@@ -376,28 +388,23 @@ def _scan_navy_bars(png_path):
     return bars, h, w
 
 
-def locate_performance_chart(pdf_path, workdir):
-    """Returns (page_index, crop_box, bottom_trim, warnings). `warnings` is
-    a list of human-readable strings the caller can surface (e.g. as a
-    response header) when detection looks uncertain -- it is informational
-    only and never blocks report generation."""
+def locate_and_crop_performance_chart(pdf_path, workdir, dpi=CHART_CROP_DPI):
+    """Finds the performance chart page, renders it, and crops out just the
+    chart + legend band, entirely in pixel space (see the module note above
+    for why). Returns (out_png_path or None, warnings)."""
     warnings = []
     with pdfplumber.open(pdf_path) as pdf:
         page_index = _find_candidate_chart_page(pdf)
-        if page_index is None:
-            warnings.append(
-                "Could not find a 'Performance' chart page in this export -- "
-                "page 3's performance chart may be missing or misplaced."
-            )
-            return 0, (0, 0, 612, 792), 0, warnings
+    if page_index is None:
+        warnings.append(
+            "Could not find a 'Performance' chart page in this export -- "
+            "page 3's performance chart may be missing or misplaced."
+        )
+        return None, warnings
 
-        page = pdf.pages[page_index]
-        page_w_pt = float(page.width)
-        page_h_pt = float(page.height)
-
-    png_prefix = os.path.join(workdir, "_detect_candidate")
+    png_prefix = os.path.join(workdir, "_perf_full")
     subprocess.run(
-        ["pdftoppm", "-r", str(DETECT_DPI), "-png", "-f", str(page_index + 1),
+        ["pdftoppm", "-r", str(dpi), "-png", "-f", str(page_index + 1),
          "-l", str(page_index + 1), pdf_path, png_prefix],
         check=True, capture_output=True,
     )
@@ -405,13 +412,17 @@ def locate_performance_chart(pdf_path, workdir):
     # "<prefix>.png" for some versions when only one page is requested).
     candidates = [f"{png_prefix}-{page_index + 1}.png", f"{png_prefix}.png",
                   f"{png_prefix}-01.png"]
-    png_path = next((p for p in candidates if os.path.exists(p)), None)
-    if png_path is None:
-        warnings.append("Could not render the candidate chart page for crop measurement.")
-        return page_index, (0, 0, page_w_pt, page_h_pt), 0, warnings
+    full_png = next((p for p in candidates if os.path.exists(p)), None)
+    if full_png is None:
+        warnings.append("Could not render the candidate chart page.")
+        return None, warnings
 
-    bars, img_h, img_w = _scan_navy_bars(png_path)
-    scale = 72.0 / DETECT_DPI  # px -> pt
+    from PIL import Image
+    im = Image.open(full_png).convert("RGB")
+    img_w, img_h = im.size
+
+    bars, _, _ = _scan_navy_bars(full_png)
+    out_png = os.path.join(workdir, "performance_chart.png")
 
     if not bars:
         warnings.append(
@@ -419,33 +430,33 @@ def locate_performance_chart(pdf_path, workdir):
             "page -- using the full page as the chart crop, which may include "
             "extra header/footer content."
         )
-        return page_index, (0, 0, page_w_pt, page_h_pt), 0, warnings
+        im.save(out_png)
+        return out_png, warnings
 
-    first_bar_bottom_px = bars[0][1]
-    y1 = page_h_pt - (first_bar_bottom_px * scale)  # top of crop (PDF coords)
+    top_px = bars[0][1] + 2  # just below the first (this chart's own) bar
 
     if len(bars) > 1:
-        second_bar_top_px = bars[1][0]
-        y0 = page_h_pt - (second_bar_top_px * scale)  # bottom of crop
+        bottom_px = bars[1][0] - 2  # just above the next section's bar
     else:
         # No second header bar on this page -- assume the chart runs most of
         # the remaining page, leaving a conservative margin for a footer.
-        y0 = page_h_pt * 0.15
+        bottom_px = img_h - int(img_h * 0.15)
         warnings.append(
             "Only one section header found on the performance chart page -- "
             "assumed the chart extends to near the bottom of the page. "
             "Worth a one-time spot check against the source PDF."
         )
 
-    if y0 >= y1:
+    if bottom_px <= top_px:
         warnings.append(
             "Performance chart crop measurement looked inverted or too small -- "
-            "falling back to the full page as the crop."
+            "using the full page as the crop."
         )
-        return page_index, (0, 0, page_w_pt, page_h_pt), 0, warnings
+        im.save(out_png)
+        return out_png, warnings
 
-    crop_box = (0, y0, page_w_pt, y1)
-    return page_index, crop_box, 0, warnings
+    im.crop((0, top_px, img_w, bottom_px)).save(out_png)
+    return out_png, warnings
 
 
 def extract(pdf_path):

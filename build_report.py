@@ -15,11 +15,16 @@ instead of a single interactive session:
      module-level ASSETS folder, so two requests generating reports at the
      same time don't clobber each other's intermediate files.
   2. The performance-chart crop is located automatically via
-     `extract_data.locate_performance_chart()` instead of requiring the
-     manual page_index/crop_box/bottom_trim calibration the skill used to
-     do by hand each time. The manual parameters are kept as optional
-     overrides (e.g. for a one-off correction), but default to None to
-     trigger auto-detection.
+     `extract_data.locate_and_crop_performance_chart()` instead of requiring
+     the manual page_index/crop_box/bottom_trim calibration the skill used
+     to do by hand each time. That function works entirely in pixel space
+     (render the candidate page once, find the chart's section-header bars,
+     crop the same image) specifically to avoid a PDF-coordinate/page-
+     rotation mismatch an earlier point-space version had -- see its
+     docstring. The manual page_index/crop_box/bottom_trim parameters are
+     kept as optional overrides for a one-off correction (using
+     `crop_performance_chart()` below, the original point-space approach),
+     but default to None to trigger auto-detection.
 
 The only bundled static asset is the White Oak logo, read from STATIC_DIR
 (shared, read-only, not per-request).
@@ -36,7 +41,7 @@ from pypdf import PdfReader, PdfWriter
 from pypdf.generic import RectangleObject
 from copy import deepcopy
 
-from extract_data import extract, locate_performance_chart
+from extract_data import extract, locate_and_crop_performance_chart
 from make_allocation_chart import (
     build_donut, CATEGORY_COLORS, CATEGORY_ORDER,
     build_breakdown_donut, classification_colors,
@@ -261,11 +266,13 @@ def build(input_pdf, output_pdf, workdir, registration_overrides=None,
     """registration_overrides: optional {account_number: display_registration}
     for one-off, client-specific label corrections.
 
-    perf_page_index / perf_crop_box / perf_bottom_trim: leave as None to
-    auto-detect the performance chart's page and crop box (see
-    extract_data.locate_performance_chart). Pass explicit values to override
-    auto-detection for a specific client, same as the original skill's
-    manual calibration parameters.
+    perf_page_index / perf_crop_box / perf_bottom_trim: leave all as None
+    (the default) to auto-detect the performance chart's page and crop,
+    entirely in pixel space (see extract_data.locate_and_crop_performance_
+    chart). Pass explicit perf_page_index + perf_crop_box to override
+    auto-detection for a specific client -- this uses the original,
+    point-space `crop_performance_chart()` below, same convention as the
+    skill's manual calibration parameters.
 
     workdir: a directory for this request's intermediate files (charts,
     cropped PDF). Must be unique per concurrent request.
@@ -280,23 +287,27 @@ def build(input_pdf, output_pdf, workdir, registration_overrides=None,
     generated_date = datetime.now().strftime("%m/%d/%Y")
 
     warnings = []
-    if perf_page_index is None or perf_crop_box is None:
-        perf_page_index, perf_crop_box, auto_trim, detect_warnings = locate_performance_chart(input_pdf, workdir)
-        if perf_bottom_trim is None:
-            perf_bottom_trim = auto_trim
-        warnings.extend(detect_warnings)
-    if perf_bottom_trim is None:
-        perf_bottom_trim = 0.0
-
     donut_path = os.path.join(workdir, "allocation_donut.png")
     build_donut(data["allocation_buckets"], donut_path, data["total_value"])
 
     classification_path = os.path.join(workdir, "classification_donut.png")
     build_breakdown_donut(data.get("allocation_breakdown", []), classification_path)
 
-    perf_png = os.path.join(workdir, "performance_chart.png")
-    crop_performance_chart(input_pdf, page_index=perf_page_index, crop_box=list(perf_crop_box),
-                            out_png=perf_png, workdir=workdir, bottom_trim=perf_bottom_trim)
+    if perf_page_index is None or perf_crop_box is None:
+        perf_png, detect_warnings = locate_and_crop_performance_chart(input_pdf, workdir)
+        warnings.extend(detect_warnings)
+        if perf_png is None:
+            # Total detection failure (e.g. no performance page found at
+            # all) -- fall back to a blank placeholder so the rest of the
+            # report still builds rather than erroring out entirely.
+            from PIL import Image
+            perf_png = os.path.join(workdir, "performance_chart.png")
+            Image.new("RGB", (1650, 500), "white").save(perf_png)
+            warnings.append("Performance chart could not be generated for this report.")
+    else:
+        perf_png = os.path.join(workdir, "performance_chart.png")
+        crop_performance_chart(input_pdf, page_index=perf_page_index, crop_box=list(perf_crop_box),
+                                out_png=perf_png, workdir=workdir, bottom_trim=(perf_bottom_trim or 0.0))
 
     c = canvas.Canvas(output_pdf, pagesize=letter)
 
