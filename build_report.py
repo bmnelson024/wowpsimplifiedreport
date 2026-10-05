@@ -223,6 +223,40 @@ def draw_accounts_section(c, top_y, data):
     return row_y - 4
 
 
+def draw_benchmark_returns(c, top_y, bench, client_name):
+    """Row of cumulative-since-inception returns, one column per chart line
+    (portfolio first, then each benchmark). Values are read off the chart
+    geometry (Orion prints no numbers), so they're shown to one decimal
+    place. Returns the y just below the block."""
+    series = bench["series"]
+    n = len(series)
+    col_w = (PAGE_W - 1.5 * inch) / n
+    rule_y = top_y + 10
+    c.setStrokeColor(RULE)
+    c.line(0.75 * inch, rule_y, PAGE_W - 0.75 * inch, rule_y)
+
+    for i, s in enumerate(series):
+        x = 0.75 * inch + i * col_w
+        is_portfolio = (i == 0)
+        label = "Portfolio" if is_portfolio else s["label"]
+        c.setFillColor(MUTED)
+        c.setFont("Helvetica", 8)
+        lines = wrap_text(label.upper(), "Helvetica", 8, col_w - 10)[:2]
+        for j, ln in enumerate(lines):
+            c.drawString(x, top_y - j * 9, ln)
+        v = s["pct"]
+        c.setFillColor(NAVY if is_portfolio else INK)
+        c.setFont("Helvetica-Bold", 16)
+        c.drawString(x, top_y - 36, f"{v:+.1f}%")
+    base = top_y - 36
+    c.setFillColor(MUTED)
+    c.setFont("Helvetica-Oblique", 7.5)
+    c.drawString(0.75 * inch, base - 14,
+                 "Read from the chart above (cumulative since inception), to the nearest 0.1%; "
+                 "not the review-period return shown on page 1.")
+    return base - 14
+
+
 def draw_gain_loss_section(c, top_y, data):
     gl = data.get("gain_loss") or {}
     section_bar(c, 0.75 * inch, top_y - 18, PAGE_W - 1.5 * inch, 18, "GAIN / LOSS SUMMARY")
@@ -515,10 +549,25 @@ def build(input_pdf, output_pdf, workdir, registration_overrides=None,
         benchmark_desc = f"the S&P 500, {legend['blend']}, and the {legend['bond']} index"
     else:
         benchmark_desc = "the S&P 500 and selected benchmark indices"
-    c.drawString(0.75 * inch, chart_top - draw_h - 14,
-                 f"Cumulative return, {data['period_start']} – {data['period_end']}, vs. {benchmark_desc}.")
+    bench = data.get("benchmark_returns")
+    if bench and bench.get("inception"):
+        caption = (f"Cumulative return since inception ({bench['inception']}) through {data['period_end']}, "
+                   f"vs. {benchmark_desc}.")
+    else:
+        caption = f"Cumulative return, {data['period_start']} – {data['period_end']}, vs. {benchmark_desc}."
+    cap_lines = wrap_text(caption, "Helvetica-Oblique", 7.8, PAGE_W - 1.5 * inch)
+    for i, ln in enumerate(cap_lines):
+        c.drawString(0.75 * inch, chart_top - draw_h - 14 - i * 10, ln)
+    cap_bottom = chart_top - draw_h - 14 - (len(cap_lines) - 1) * 10
 
-    draw_gain_loss_section(c, chart_top - draw_h - 14 - 36, data)
+    next_top = cap_bottom - 36
+    if bench and bench.get("series"):
+        next_top = draw_benchmark_returns(c, cap_bottom - 26, bench, data["client_name"]) - 22
+    else:
+        warnings.append("Benchmark return figures could not be read from the performance chart -- "
+                        "the table under the chart was left out.")
+
+    draw_gain_loss_section(c, next_top, data)
 
     disc_y = 1.05 * inch
     c.setStrokeColor(RULE)

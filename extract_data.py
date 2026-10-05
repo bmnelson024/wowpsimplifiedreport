@@ -300,6 +300,100 @@ def extract_benchmark_legend(pdf, client_name):
     return None
 
 
+def extract_benchmark_returns(pdf):
+    """Reads each series' ending value straight off the vector "Performance
+    And Benchmark" chart. Orion prints NO numeric benchmark returns anywhere
+    in the export (checked against a real 23-page export), but the chart is
+    drawn as vector polylines, so a series' end value can be recovered from
+    its last point's y-position against the chart's labeled y-axis.
+
+    The chart is CUMULATIVE SINCE INCEPTION (its x-axis starts at the
+    account's inception date, e.g. 04/19/22), NOT the review period, so
+    these figures are labeled that way downstream and are not expected to
+    equal the period "Total:" return used in the page-1 tile.
+
+    Returns {"inception": "M/D/YYYY" or None, "series": [{"label", "pct"}...]}
+    with series ordered as the chart legend (portfolio first), or
+    (None, reason) if the chart can't be read confidently."""
+    import datetime as _dt
+
+    idx = _find_candidate_chart_page(pdf)
+    if idx is None:
+        return None, "chart page not found"
+    page = pdf.pages[idx]
+
+    # Legend swatches: short, 2pt-wide, single-color horizontal strokes,
+    # all at the same y. Left-to-right order == legend label order.
+    swatches = [l for l in page.lines
+                if l.get("linewidth") == 2.0 and isinstance(l.get("stroking_color"), tuple)
+                and len(l["pts"]) == 2 and abs(l["pts"][0][1] - l["pts"][1][1]) < 0.5
+                and abs(l["pts"][1][0] - l["pts"][0][0]) < 40]
+    if swatches:
+        ys = [round(s["pts"][0][1]) for s in swatches]
+        legend_y = max(set(ys), key=ys.count)
+        swatches = sorted((s for s in swatches if round(s["pts"][0][1]) == legend_y),
+                          key=lambda s: s["pts"][0][0])
+    if len(swatches) < 2:
+        return None, "legend swatches not found"
+
+    # Legend labels, split at each swatch's x so multi-word labels stay whole.
+    words = [w for w in page.extract_words() if abs(w["top"] - (legend_y - 1)) < 8 or abs(w["top"] - legend_y) < 8]
+    labels = []
+    xs = [s["pts"][0][0] for s in swatches] + [1e9]
+    for a, b in zip(xs, xs[1:]):
+        labels.append(" ".join(w["text"] for w in words if a <= w["x0"] < b).strip())
+
+    # Y axis: labeled percent ticks -> nearest horizontal gridline -> linear map.
+    tick_words = [w for w in page.extract_words()
+                  if re.fullmatch(r"-?\d+(\.\d+)?%", w["text"]) and w["x0"] < 100]
+    grid_ys = sorted({round(l["pts"][0][1], 1) for l in page.lines
+                      if abs(l["pts"][0][1] - l["pts"][1][1]) < 0.3
+                      and abs(l["pts"][1][0] - l["pts"][0][0]) > 300})
+    pairs = []
+    for w in tick_words:
+        cy = (w["top"] + w["bottom"]) / 2
+        near = min(grid_ys, key=lambda g: abs(g - cy), default=None)
+        if near is not None and abs(near - cy) < 6:
+            pairs.append((near, float(w["text"].rstrip("%"))))
+    pairs = sorted(set(pairs))
+    if len(pairs) < 2 or pairs[0][0] == pairs[-1][0]:
+        return None, "y-axis ticks not found"
+    # Least-squares line through all labeled gridlines (gridlines snap to
+    # half-pixels, so a 2-point fit alone can be off by ~0.1%).
+    n = len(pairs)
+    mean_y = sum(p[0] for p in pairs) / n
+    mean_v = sum(p[1] for p in pairs) / n
+    slope = (sum((p[0] - mean_y) * (p[1] - mean_v) for p in pairs)
+             / sum((p[0] - mean_y) ** 2 for p in pairs))
+
+    def y_to_pct(y):
+        return mean_v + (y - mean_y) * slope
+
+    out = []
+    for sw, label in zip(swatches, labels):
+        color = sw["stroking_color"]
+        series = [c for c in page.curves if c.get("stroking_color") == color and len(c["pts"]) > 10]
+        if not series:
+            return None, f"series for '{label}' not found"
+        pts = series[0]["pts"]
+        first, last = min(pts, key=lambda p: p[0]), max(pts, key=lambda p: p[0])
+        # Cumulative-from-zero sanity check: every series should start at ~0%.
+        if abs(y_to_pct(first[1])) > 3.0:
+            return None, "chart does not start from 0% (not a cumulative-since-inception chart)"
+        out.append({"label": label, "pct": round(y_to_pct(last[1]), 2)})
+
+    inception = None
+    dates = [w["text"] for w in page.extract_words()
+             if re.fullmatch(r"\d\d/\d\d/\d\d", w["text"]) and w["top"] > legend_y - 40]
+    if dates:
+        try:
+            d = _dt.datetime.strptime(dates[0], "%m/%d/%y")
+            inception = f"{d.month}/{d.day}/{d.year}"
+        except ValueError:
+            pass
+    return {"inception": inception, "series": out}, None
+
+
 # ---------------------------------------------------------------------------
 # Automatic performance-chart page/crop detection.
 #
@@ -569,6 +663,10 @@ def extract(pdf_path):
         data["holdings_by_category"] = extract_holdings_by_category(pdf, top_n=10)
         data["gain_loss"] = extract_gain_loss_summary(pdf)
         data["benchmark_legend"] = extract_benchmark_legend(pdf, data["client_name"])
+        try:
+            data["benchmark_returns"], data["benchmark_returns_issue"] = extract_benchmark_returns(pdf)
+        except Exception as e:  # never let this optional table break the report
+            data["benchmark_returns"], data["benchmark_returns_issue"] = None, f"error: {e}"
 
     data["total_value"] = data["activity"].get("Ending Market Value w/ Bond Accrual") \
         or sum(a["value"] for a in data["accounts"])
