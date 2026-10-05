@@ -224,10 +224,9 @@ def draw_accounts_section(c, top_y, data):
 
 
 def draw_benchmark_returns(c, top_y, bench, client_name):
-    """Row of cumulative-since-inception returns, one column per chart line
-    (portfolio first, then each benchmark). Values are read off the chart
-    geometry (Orion prints no numbers), so they're shown to one decimal
-    place. Returns the y just below the block."""
+    """Row of review-period returns from Orion's own "Performance History"
+    table, one column per series (portfolio first, then each benchmark).
+    Returns the y just below the block."""
     series = bench["series"]
     n = len(series)
     col_w = (PAGE_W - 1.5 * inch) / n
@@ -247,13 +246,12 @@ def draw_benchmark_returns(c, top_y, bench, client_name):
         v = s["pct"]
         c.setFillColor(NAVY if is_portfolio else INK)
         c.setFont("Helvetica-Bold", 16)
-        c.drawString(x, top_y - 36, f"{v:+.1f}%")
+        c.drawString(x, top_y - 36, f"{v:+.2f}%")
     base = top_y - 36
     c.setFillColor(MUTED)
     c.setFont("Helvetica-Oblique", 7.5)
     c.drawString(0.75 * inch, base - 14,
-                 "Read from the chart above (cumulative since inception), to the nearest 0.1%; "
-                 "not the review-period return shown on page 1.")
+                 f"Returns for {bench['period_start']} – {bench['period_end']}, as reported by Orion.")
     return base - 14
 
 
@@ -550,11 +548,7 @@ def build(input_pdf, output_pdf, workdir, registration_overrides=None,
     else:
         benchmark_desc = "the S&P 500 and selected benchmark indices"
     bench = data.get("benchmark_returns")
-    if bench and bench.get("inception"):
-        caption = (f"Cumulative return since inception ({bench['inception']}) through {data['period_end']}, "
-                   f"vs. {benchmark_desc}.")
-    else:
-        caption = f"Cumulative return, {data['period_start']} – {data['period_end']}, vs. {benchmark_desc}."
+    caption = f"Cumulative return, {data['period_start']} – {data['period_end']}, vs. {benchmark_desc}."
     cap_lines = wrap_text(caption, "Helvetica-Oblique", 7.8, PAGE_W - 1.5 * inch)
     for i, ln in enumerate(cap_lines):
         c.drawString(0.75 * inch, chart_top - draw_h - 14 - i * 10, ln)
@@ -564,8 +558,8 @@ def build(input_pdf, output_pdf, workdir, registration_overrides=None,
     if bench and bench.get("series"):
         next_top = draw_benchmark_returns(c, cap_bottom - 26, bench, data["client_name"]) - 22
     else:
-        warnings.append("Benchmark return figures could not be read from the performance chart -- "
-                        "the table under the chart was left out.")
+        why = data.get("benchmark_returns_issue") or "unknown reason"
+        warnings.append("Benchmark returns table left out of page 3 (" + why + ").")
 
     draw_gain_loss_section(c, next_top, data)
 
