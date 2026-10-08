@@ -4,7 +4,24 @@ Flask backend for the White Oak Simplified Client Report.
 Exposes:
   GET  /health            -- plain liveness check
   POST /generate-report   -- multipart/form-data with an "orion_pdf" file
-                              field. Returns the generated 3-page PDF.
+                              field (the full household export). Returns the
+                              generated PDF (3 pages, or more when a
+                              self-directed split makes page 2 run long).
+
+                              Optional fields (all backward compatible --
+                              omit them for a plain household report):
+                                managed_pdf        the "all but self-directed"
+                                                   export (one file)
+                                selfdirected_pdfs  one single-account export
+                                                   per self-directed account
+                                                   (field may repeat)
+                                rmd                JSON list of Required
+                                                   Minimum Distribution rows:
+                                                   [{"account", "required",
+                                                   "taken", "year"?,
+                                                   "deadline"?, "as_of"?}]
+                              managed_pdf and selfdirected_pdfs must be given
+                              together.
 
 Auth: a shared secret passed as the "X-Report-Key" header, checked against
 the REPORT_API_KEY environment variable. This is a basic deterrent (keeps
@@ -24,6 +41,7 @@ the automatic performance-chart detection ran into is surfaced as an
 "X-Report-Warnings" response header (informational only -- it does not
 block the response) so the front-end can optionally show a heads-up.
 """
+import json
 import os
 import tempfile
 import traceback
@@ -36,7 +54,7 @@ app = Flask(__name__)
 
 ALLOWED_ORIGIN = os.environ.get("ALLOWED_ORIGIN", "*")
 REPORT_API_KEY = os.environ.get("REPORT_API_KEY")  # required in production
-MAX_UPLOAD_BYTES = 40 * 1024 * 1024  # 40MB -- Orion exports are usually a few MB
+MAX_UPLOAD_BYTES = 100 * 1024 * 1024  # 100MB total -- up to ~4 Orion exports (a few MB each) per request
 
 app.config["MAX_CONTENT_LENGTH"] = MAX_UPLOAD_BYTES
 
@@ -75,13 +93,61 @@ def generate_report():
     if not uploaded.filename:
         return jsonify({"error": "No file selected."}), 400
 
+    # Optional self-directed split: both files together, or neither.
+    managed_upload = request.files.get("managed_pdf")
+    if managed_upload is not None and not managed_upload.filename:
+        managed_upload = None
+    sd_uploads = [f for f in request.files.getlist("selfdirected_pdfs") if f and f.filename]
+    if bool(managed_upload) != bool(sd_uploads):
+        return jsonify({"error": "The self-directed split needs both 'managed_pdf' (the all-but-self-directed "
+                                 "export) and at least one 'selfdirected_pdfs' file."}), 400
+
+    # Optional RMD rows (manually entered -- not in the Orion export).
+    rmd = None
+    rmd_raw = request.form.get("rmd")
+    if rmd_raw:
+        try:
+            rmd = json.loads(rmd_raw)
+            if not isinstance(rmd, list):
+                raise ValueError("rmd must be a list")
+            clean = []
+            for r in rmd:
+                account = str(r["account"]).strip()
+                required, taken = float(r["required"]), float(r.get("taken") or 0)
+                if not account or required < 0 or taken < 0:
+                    raise ValueError("bad row")
+                row = {"account": account, "required": required, "taken": taken}
+                if r.get("year"):
+                    row["year"] = int(r["year"])
+                for k in ("deadline", "as_of"):
+                    if r.get(k):
+                        row[k] = str(r[k])
+                clean.append(row)
+            rmd = clean or None
+        except (ValueError, KeyError, TypeError):
+            return jsonify({"error": "Could not read the RMD rows (each needs an account name and a "
+                                     "required amount of zero or more)."}), 400
+
     with tempfile.TemporaryDirectory(prefix="wo_report_") as workdir:
         input_pdf = os.path.join(workdir, "input.pdf")
         uploaded.save(input_pdf)
 
+        managed_pdf = None
+        if managed_upload:
+            managed_pdf = os.path.join(workdir, "managed.pdf")
+            managed_upload.save(managed_pdf)
+        selfdirected_pdfs = []
+        for i, f in enumerate(sd_uploads):
+            p = os.path.join(workdir, f"selfdirected_{i}.pdf")
+            f.save(p)
+            selfdirected_pdfs.append(p)
+
         output_pdf = os.path.join(workdir, "output.pdf")
         try:
-            result = build(input_pdf, output_pdf, workdir)
+            result = build(input_pdf, output_pdf, workdir,
+                           managed_pdf=managed_pdf,
+                           selfdirected_pdfs=selfdirected_pdfs or None,
+                           rmd=rmd)
         except Exception as e:
             app.logger.error("Report generation failed: %s\n%s", e, traceback.format_exc())
             return jsonify({

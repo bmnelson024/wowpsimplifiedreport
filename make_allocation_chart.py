@@ -1,11 +1,8 @@
-"""Builds the simplified asset-allocation donut chart.
-
-Verbatim port of the verified `white-oak-simplified-review` skill's chart
-module -- no behavior changes from the original.
-"""
+"""Builds the simplified asset-allocation donut chart."""
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import matplotlib.font_manager as fm
 
 NAVY = "#1B3557"
 GOLD = "#C9A669"
@@ -48,7 +45,10 @@ def build_donut(buckets, out_path, total_value):
 
 def _lighten(hex_color, amount):
     """Mixes a hex color toward white by `amount` (0 = unchanged, 1 =
-    white)."""
+    white). Used to shade a granular classification's color as a tint of
+    its parent bucket's color, so e.g. Large/Mid/Small Cap read as a family
+    of navy shades under the same Equities navy used on the 4-bucket
+    donut, rather than introducing a whole new unrelated palette."""
     h = hex_color.lstrip("#")
     r, g, b = (int(h[i:i + 2], 16) for i in (0, 2, 4))
     r = r + (255 - r) * amount
@@ -58,9 +58,11 @@ def _lighten(hex_color, amount):
 
 
 def classification_colors(rows):
-    """Assigns each row a shade of its parent bucket's color -- darkest for
-    the largest row in that bucket, lighter for smaller ones in the same
-    bucket."""
+    """Assigns each row (from extract_data.top_allocation_breakdown, sorted
+    largest-first) a shade of its parent bucket's color -- darkest for the
+    largest row in that bucket, lighter for smaller ones in the same
+    bucket -- so the chart reads as a further breakdown of the 4-bucket
+    donut rather than a disconnected palette."""
     shade_steps = [0.0, 0.30, 0.50, 0.65, 0.75]
     seen_in_parent = {}
     colors = []
@@ -73,8 +75,12 @@ def classification_colors(rows):
 
 
 def build_breakdown_donut(rows, out_path, center_lines=("Asset", "Classification")):
-    """Second, more granular donut, colored as shades of the 4-bucket
-    donut's own colors via `classification_colors`."""
+    """Second, more granular donut (Large Cap, Mid Cap, High Yield Bond,
+    etc. -- `rows` from extract_data.top_allocation_breakdown), colored as
+    shades of the 4-bucket donut's own colors via `classification_colors`.
+    No dollar total in the center (that's already shown on the 4-bucket
+    donut right next to this one) -- just a short label, stacked on two
+    lines so it fits inside the hole, so it doesn't sit empty."""
     values = [r["value"] for r in rows]
     colors = classification_colors(rows)
 

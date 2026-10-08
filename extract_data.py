@@ -6,17 +6,14 @@ Pulls the numbers we need out of a standard Orion "Annual Review Report" /
 (Activity Summary + Allocation Overview on page 1, Portfolio Overview /
 accounts on page 3, Performance & Benchmark chart around the "Performance"
 section header). If Orion changes its layout this will need re-checking,
-but the parsing keys off table headers / row labels wherever possible, so
-it should be reasonably tolerant of accounts being added/removed.
+but the parsing keys off table headers / row labels rather than fixed page
+numbers wherever possible, so it should be reasonably tolerant of accounts
+being added/removed.
 
-This is a server-side port of the `white-oak-simplified-review` skill's
-extract_data.py. The extraction logic below (money/pct parsing, the Orion
-quirk workarounds, holdings/gain-loss/benchmark extraction) is reproduced
-verbatim from the verified skill. The one addition is
-`locate_and_crop_performance_chart()`, which automates what the skill
-previously did by hand each time (rendering a candidate page and visually
-measuring the chart's crop box) -- see its docstring for the method and
-its limits.
+Merged version (10/2026): includes the server-side additions (automatic
+performance-chart page/crop detection in pixel space, and the Orion
+"Performance History" benchmark-returns table) together with the
+self-directed / managed-accounts support.
 """
 import os
 import re
@@ -94,8 +91,23 @@ CATEGORY_MAP = {
     "government bond": "Fixed Income",
     "us bond": "Fixed Income",
     "international bond": "Fixed Income",
+    "securitized bond - diversified": "Fixed Income",
     "cash": "Cash & Equivalents",
     "money market": "Cash & Equivalents",
+    # Sector-fund and equity-adjacent labels -- confirmed (McSwain export)
+    # by cross-checking each one against the Portfolio Appraisal section
+    # its underlying holding actually sits in (all three were in that
+    # export's "Equity" section, alongside every other common-stock
+    # holding), so they're categorized as Equities for consistency with
+    # the page-2 holdings-by-asset-class list, which buckets by that same
+    # appraisal section. A specific sector name (here "Technology") can
+    # appear in place of the generic "Sector" label seen in earlier
+    # clients -- add other sector names here as they show up (Energy,
+    # Financials, Health Care, Real Estate, etc.) rather than leaving them
+    # to fall through to "Other".
+    "technology": "Equities",
+    "preferred stock": "Equities",
+    "private equity": "Equities",
 }
 
 
@@ -106,9 +118,14 @@ def categorize(label):
 
 def top_allocation_breakdown(allocation_rows, top_n=7):
     """Orion's raw Allocation Overview rows (Large Cap, Mid Cap, High Yield
-    Bond, etc.) sorted by value descending, keeping the largest `top_n`
-    individually and folding everything past that into a single 'Other'
-    row."""
+    Bond, etc. -- the granular labels behind the 4-bucket rollup) sorted by
+    value descending, keeping the largest `top_n` individually and folding
+    everything past that into a single 'Other' row. Caps a real client's
+    ~15 labels down to a legible legend (a donut with a legend entry per
+    label doesn't stay readable past 7-8 slices), while each kept row also
+    carries its parent bucket (via `categorize`) so a caller can color it
+    as a shade of that bucket's color -- ties this chart visually back to
+    the 4-bucket Asset Allocation donut it's breaking down further."""
     rows = sorted(allocation_rows, key=lambda r: r["value"], reverse=True)
     kept, rest = rows[:top_n], rows[top_n:]
     out = [
@@ -135,8 +152,14 @@ def _find_section_page(pdf, title):
 
 
 def _all_holdings(pdf):
-    """Pulls every individual security out of the Portfolio Appraisal
-    tables (pages between the report start and the 'Performance' section)."""
+    """Pulls every individual security out of the Portfolio Appraisal tables
+    (pages between the report start and the 'Performance' section). The
+    appraisal table is grouped by asset class with a header row (e.g.
+    'Equity') whose other cells are all empty, and a bold/doubled subtotal
+    row per section (and a bare 'Total:' grand-total row at the very end)
+    -- all skipped. Rows are identified by their column count (10) so we
+    don't accidentally sweep in the Portfolio Overview accounts table,
+    which shares the same page range but has a different shape."""
     performance_start = _find_section_page(pdf, "Performance")
     end = performance_start if performance_start is not None else len(pdf.pages)
 
@@ -153,6 +176,9 @@ def _all_holdings(pdf):
                 if all(c is None for c in row[1:]):
                     current_section = _dedupe_pairs(label)
                     continue
+                # Subtotal / grand-total rows: Units (row[1]) is blank --
+                # either None, or '' (pdfplumber gives '' for the bare
+                # grand-total row specifically).
                 if row[1] is None or row[1] == "":
                     continue
                 if _dedupe_pairs(label).lower().startswith("total"):
@@ -178,12 +204,17 @@ SECTION_CATEGORY_MAP = {
 
 
 def extract_top_holdings(pdf, top_n=20):
+    """Flat top-N holdings across the whole portfolio, largest by market value."""
     holdings = _all_holdings(pdf)
     holdings.sort(key=lambda h: h["market_value"], reverse=True)
     return holdings[:top_n]
 
 
 def extract_holdings_by_category(pdf, top_n=10):
+    """Groups holdings by the same asset-class buckets as the allocation
+    donut, sorts each by market value, and returns the top `top_n` per
+    bucket plus the total count/value in that bucket (so a caller can show
+    "10 of 168 positions" and how much of the bucket that top-N covers)."""
     holdings = _all_holdings(pdf)
     by_cat = {}
     for h in holdings:
@@ -203,7 +234,9 @@ def extract_holdings_by_category(pdf, top_n=10):
 
 def _money_loose(s):
     """Like _money, but tolerant of stray footnote-marker characters Orion
-    sometimes appends after the number."""
+    sometimes appends after the number (e.g. '$3,707,141.13 ᴸ'), which
+    trip up _money's plain float() parse and would otherwise silently come
+    back as 0.0. Pulls the numeric amount out with a regex instead."""
     if not s:
         return 0.0
     m = re.search(r"(-?)\$?([\d,]+\.\d{2})", s)
@@ -214,10 +247,23 @@ def _money_loose(s):
 
 
 def extract_gain_loss_summary(pdf):
-    """Realized and unrealized gain/loss totals -- see the skill's notes on
-    the Unrealized Gain/Loss column bug: unrealized is computed as
-    Market Value - Cost Basis rather than trusting Orion's own (duplicate)
-    column."""
+    """Realized and unrealized gain/loss totals for the period, from the
+    bare grand-total rows at the end of the "Realized Gain/Loss" and
+    "Unrealized Gain/Loss" sections (same bare-'Total:' pattern as the
+    Performance and Portfolio Appraisal grand totals elsewhere in this
+    file).
+
+    Important quirk: in this Orion export, the "Gain/Loss" total *column*
+    printed on the Unrealized Gain/Loss grand-total row is not actually the
+    unrealized figure -- it's a duplicate of the Realized Gain/Loss total
+    (confirmed: every per-registration subtotal in the Unrealized section
+    matches its Realized-section counterpart exactly, and almost every
+    individual holding's Gain/Loss cell in that section reads "N/A" rather
+    than a computed value). So instead of trusting that column, unrealized
+    gain/loss is computed directly from the same row's own Cost Basis and
+    Market Value totals (Market Value - Cost Basis), which are real,
+    independently-tabulated figures -- and which cross-check against the
+    portfolio's total value elsewhere in the report."""
     realized_start = _find_section_page(pdf, "Realized Gain/Loss")
     unrealized_start = _find_section_page(pdf, "Unrealized Gain/Loss")
     end = len(pdf.pages)
@@ -251,7 +297,12 @@ def extract_gain_loss_summary(pdf):
 
 
 def extract_total_return(pdf):
-    """Household-level total return % for the period."""
+    """Finds the household-level total return % for the period, from the
+    grand-total row at the bottom of the Performance Summary section
+    (spans the "Performance" section through the page before "Realized
+    Gain/Loss"). That row is bold/doubled like other Orion total rows, but
+    is distinguishable from each account's own subtotal because it starts
+    with a bare 'Total:' with no registration name in front of it."""
     start = end = None
     for i, page in enumerate(pdf.pages):
         text = page.extract_text() or ""
@@ -282,9 +333,17 @@ def extract_total_return(pdf):
 
 def extract_benchmark_legend(pdf, client_name):
     """Finds the legend line on the "Performance And Benchmark" chart page
-    and splits it into the three benchmark labels. Returns None if not
-    found, so the caller falls back to a generic caption rather than
-    guessing."""
+    -- e.g. "<client name> Morningstar US Core Bond S&P 500 (TR) 50% S&P /
+    48% AGG / 2% Cash" -- and splits it into the three benchmark labels.
+
+    This exists because the benchmark blend is household-specific (one
+    client's report showed "a 60/40 stock-bond blend", another showed "50%
+    S&P / 48% AGG / 2% Cash") -- so the page-3 caption must be built from
+    the actual labels in this export rather than a hardcoded blend name.
+    The bond index and market index are anchored on their known Orion
+    labels since only the third (custom blend) label actually varies;
+    returns None if the legend line isn't found, so the caller can fall
+    back to a generic caption instead of guessing."""
     for page in pdf.pages:
         text = page.extract_text() or ""
         for line in text.split("\n"):
@@ -532,10 +591,17 @@ def extract(pdf_path):
         page1 = pdf.pages[0]
         tables = page1.extract_tables()
 
-        # Table 0: Household / Period / Advisor
+        # Table 0: Household / Period / Advisor -- the label on this first row
+        # varies by report scope: "Household:" for a full household export,
+        # "Account:" for a single-account export, "Self:" for a custom
+        # multi-account group (e.g. "4 Accounts") -- try each rather than
+        # assuming "Household:", or client_name silently falls back to
+        # "Client" for any report that isn't household-scoped.
         meta = tables[0]
         meta_map = {row[0].strip(): row[1] for row in meta if row and row[0] and len(row) > 1 and row[1]}
-        data["client_name"] = meta_map.get("Household:", "Client").strip()
+        data["client_name"] = (
+            meta_map.get("Household:") or meta_map.get("Account:") or meta_map.get("Self:") or "Client"
+        ).strip()
         period_raw = meta_map.get("Period:", "").strip()
         data["period_raw"] = period_raw
         m = re.match(r"(\d+/\d+/\d+)\s*to\s*(\d+/\d+/\d+)", period_raw)
@@ -547,7 +613,7 @@ def extract(pdf_path):
         activity = {}
         for row in tables[1]:
             label = _clean_label(row[0])
-            if not row[0] or label in ("",) or "Period" in "".join(str(c) for c in row if c):
+            if not row[0] or label in ("", ) or "Period" in "".join(str(c) for c in row if c):
                 continue
             if len(row) >= 2 and row[1] and "$" in str(row[1]):
                 activity[label] = _money(row[1])
@@ -580,27 +646,33 @@ def extract(pdf_path):
         data["allocation_buckets"] = buckets
         data["allocation_breakdown"] = top_allocation_breakdown(allocation_rows, top_n=7)
 
-        # Page 3: Portfolio Overview (accounts)
-        page3 = pdf.pages[2]
+        # Portfolio Overview (accounts). Page position is NOT stable across
+        # report scopes -- it's page 3 (index 2) for a full household export
+        # and a multi-account group export, but page 2 (index 1) for a
+        # single-account export (fewer preceding pages). Search for the
+        # table by its own header cell instead of assuming a fixed page.
         accounts = []
-        for t in page3.extract_tables():
-            if not t or not t[0] or not t[0][0]:
-                continue
-            if "Portfolio Overview" not in str(t[0][0]):
-                continue
-            for row in t[1:]:
-                if not row or not row[0]:
+        for page in pdf.pages:
+            for t in page.extract_tables():
+                if not t or not t[0] or not t[0][0]:
                     continue
-                acct_no = _clean_label(row[0])
-                if _is_header_or_total(acct_no, ["Total:", "Total", "Account Number"]):
+                if "Portfolio Overview" not in str(t[0][0]):
                     continue
-                accounts.append({
-                    "account_number": acct_no,
-                    "registration": _clean_label(row[1]),
-                    "type": _clean_label(row[2]),
-                    "style": _clean_label(row[3]),
-                    "value": _money(row[4]),
-                })
+                for row in t[1:]:
+                    if not row or not row[0]:
+                        continue
+                    acct_no = _clean_label(row[0])
+                    if _is_header_or_total(acct_no, ["Total:", "Total", "Account Number"]):
+                        continue
+                    accounts.append({
+                        "account_number": acct_no,
+                        "registration": _clean_label(row[1]),
+                        "type": _clean_label(row[2]),
+                        "style": _clean_label(row[3]),
+                        "value": _money(row[4]),
+                    })
+            if accounts:
+                break
         data["accounts"] = accounts
         data["total_return_pct"] = extract_total_return(pdf)
         data["top_holdings"] = extract_top_holdings(pdf, top_n=20)
@@ -617,3 +689,86 @@ def extract(pdf_path):
         or sum(a["value"] for a in data["accounts"])
 
     return data
+
+
+def build_combined_data(household_pdf, managed_pdf=None, selfdirected_pdfs=None):
+    """Combines a household export with an optional 'managed accounts'
+    export (the household minus one or more self-directed accounts, e.g.
+    Orion's "4 Accounts" custom-group export) and optional self-directed
+    single-account export(s), for households where a client invests some
+    of their own money alongside what White Oak manages.
+
+    Design (confirmed with Brian, McSwain round): dollar totals stay as the
+    overall household as always -- Portfolio Value, Change This Period,
+    Income Received, the Accounts table, and both Asset Allocation donuts
+    all still come from `household_pdf`, unchanged. Only the two things
+    that are actually about performance/holdings get split out:
+      - Portfolio Return and the page-3 Performance vs. Benchmarks chart
+        use `managed_pdf` instead of the household blend, since Orion
+        computes a real, independent TWR for whatever account group that
+        export covers -- never derive a "managed-only" % by subtracting or
+        averaging household and self-directed percentages yourselves, TWR
+        doesn't combine that way and it risks misstating performance.
+      - Holdings by Asset Class (page 2) also switches to `managed_pdf`'s
+        own holdings, and each self-directed account gets its own small
+        labeled holdings list instead of being folded into the normal
+        Equities/Fixed Income/Cash buckets.
+
+    Which accounts land in "managed" vs. "self-directed" varies household
+    to household and is entirely up to which exports Brian sends -- treat
+    whatever `managed_pdf` covers as the authoritative "managed" grouping
+    for both performance and holdings (don't try to reconstruct it from
+    the household export minus a guessed set of accounts).
+
+    A self-directed account is identified by Brian, not detected
+    automatically: he said the masked account NUMBER (not the display
+    registration, which can collide with a real managed account's name --
+    seen in McSwain's export, where both the Legacy account and the actual
+    Core account are labeled "Franklin McSwain Core-Individual") ends in
+    "GACY" (the tail of "...LEGACY" surviving Orion's masking) for a
+    self-directed account, but the reliable approach is simply: whichever
+    account(s) Brian sends as separate self-directed exports are the
+    self-directed ones for that report."""
+    data = extract(household_pdf)
+    data["managed_pdf_path"] = managed_pdf
+
+    if managed_pdf:
+        managed_data = extract(managed_pdf)
+        data["managed_total_return_pct"] = managed_data["total_return_pct"]
+        data["managed_holdings_by_category"] = managed_data["holdings_by_category"]
+        data["managed_benchmark_legend"] = managed_data["benchmark_legend"]
+        data["managed_benchmark_returns"] = managed_data.get("benchmark_returns")
+        data["managed_benchmark_returns_issue"] = managed_data.get("benchmark_returns_issue")
+        data["managed_gain_loss"] = managed_data["gain_loss"]
+        data["managed_client_name"] = managed_data["client_name"]
+
+    if selfdirected_pdfs:
+        self_directed = []
+        for p in selfdirected_pdfs:
+            sd = extract(p)
+            self_directed.append({
+                # Masked account number(s) from this export's own Portfolio
+                # Overview -- lets the page-1 Accounts table break the
+                # self-directed account out of any identically-named managed
+                # account (McSwain: both labeled "...Core-Individual").
+                "account_numbers": [a["account_number"] for a in sd["accounts"]],
+                "name": sd["client_name"],
+                "total_return_pct": sd["total_return_pct"],
+                "top_holdings": sd["top_holdings"],
+                "total_value": sd["total_value"],
+                "gain_loss": sd["gain_loss"],
+                "period_start": sd["period_start"],
+                "period_end": sd["period_end"],
+            })
+        data["self_directed"] = self_directed
+
+    return data
+
+
+if __name__ == "__main__":
+    import sys
+    import json
+    path = sys.argv[1] if len(sys.argv) > 1 else \
+        "/root/.claude/uploads/80cd8d3e-ad13-51e3-830f-7f3126a814ee/4cd6c332-FisherScott_24_H24_ClientReview-WhiteOak_WoWp.pdf"
+    d = extract(path)
+    print(json.dumps(d, indent=2))
