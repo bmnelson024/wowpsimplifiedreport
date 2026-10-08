@@ -64,8 +64,8 @@ def add_cors_headers(resp):
     resp.headers["Access-Control-Allow-Origin"] = ALLOWED_ORIGIN
     resp.headers["Access-Control-Allow-Headers"] = "Content-Type, X-Report-Key"
     resp.headers["Access-Control-Allow-Methods"] = "POST, OPTIONS, GET"
-    # Let browser JS read the warnings header from the fetch() response.
-    resp.headers["Access-Control-Expose-Headers"] = "X-Report-Warnings, X-Report-Client"
+    # Let browser JS read the warnings / filename headers from the fetch() response.
+    resp.headers["Access-Control-Expose-Headers"] = "X-Report-Warnings, X-Report-Client, Content-Disposition"
     return resp
 
 
