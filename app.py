@@ -166,7 +166,8 @@ def generate_report():
         with open(output_pdf, "rb") as f:
             pdf_bytes = f.read()
 
-    import io
+    import gc, io
+    gc.collect()
     resp = send_file(
         io.BytesIO(pdf_bytes),
         mimetype="application/pdf",

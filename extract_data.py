@@ -585,6 +585,54 @@ def locate_and_crop_performance_chart(pdf_path, workdir, dpi=CHART_CROP_DPI):
     return out_png, warnings
 
 
+def _install_page_cache_release():
+    """pdfplumber keeps every parsed page object (chars, lines, rects...) in
+    memory for as long as the PDF is open -- measured ~8MB per page, so a
+    30-page Orion export held ~175MB before any report work began, and on
+    Render's 512MB free tier that got the service OOM-killed. The extraction
+    helpers below return plain Python lists/strings, so it is safe to drop a
+    page's cache the moment one of these extract calls finishes (anything
+    needed again is simply re-parsed on demand). Measured: 12 pages grew RSS
+    by ~70MB before, ~0MB after."""
+    from pdfplumber.page import Page
+    if getattr(Page, "_wo_cache_release", False):
+        return
+
+    def wrap(orig):
+        def inner(self, *a, **k):
+            try:
+                return orig(self, *a, **k)
+            finally:
+                try:
+                    self.flush_cache()
+                except Exception:
+                    pass
+        inner.__name__ = orig.__name__
+        inner.__doc__ = orig.__doc__
+        return inner
+
+    for name in ("extract_tables", "extract_table", "extract_text", "extract_words"):
+        if hasattr(Page, name):
+            setattr(Page, name, wrap(getattr(Page, name)))
+    Page._wo_cache_release = True
+
+
+_install_page_cache_release()
+
+
+def _flush_pages(pdf):
+    """Drops pdfplumber's per-page parsed-object caches. pdfplumber keeps every
+    page it has touched (chars, lines, rects...) in memory until the PDF is
+    closed, which for a 30-page Orion export is ~175MB -- enough, with a
+    second worker on Render's 512MB free tier, to get the service OOM-killed.
+    Everything we need from a page is extracted before this is called."""
+    for p in pdf.pages:
+        try:
+            p.flush_cache()
+        except Exception:
+            pass
+
+
 def extract(pdf_path):
     data = {}
     with pdfplumber.open(pdf_path) as pdf:
@@ -671,14 +719,21 @@ def extract(pdf_path):
                         "style": _clean_label(row[3]),
                         "value": _money(row[4]),
                     })
+            page.flush_cache()
             if accounts:
                 break
+        _flush_pages(pdf)
         data["accounts"] = accounts
         data["total_return_pct"] = extract_total_return(pdf)
+        _flush_pages(pdf)
         data["top_holdings"] = extract_top_holdings(pdf, top_n=20)
+        _flush_pages(pdf)
         data["holdings_by_category"] = extract_holdings_by_category(pdf, top_n=10)
+        _flush_pages(pdf)
         data["gain_loss"] = extract_gain_loss_summary(pdf)
+        _flush_pages(pdf)
         data["benchmark_legend"] = extract_benchmark_legend(pdf, data["client_name"])
+        _flush_pages(pdf)
         try:
             data["benchmark_returns"], data["benchmark_returns_issue"] = extract_benchmark_returns(
                 pdf, data["period_start"], data["period_end"])
