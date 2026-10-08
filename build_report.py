@@ -386,7 +386,7 @@ class _NullCanvas:
         return lambda *args, **kwargs: None
 
 
-def draw_holdings_section(c, data, generated_date, start_page_num, total_pages):
+def draw_holdings_section(c, data, generated_date, start_page_num, total_pages, density=1.0):
     """Draws the Holdings by Asset Class section (and, following it, any
     Self-Directed holdings sections) starting on a fresh page, including
     that page's header. Paginates onto additional pages -- redrawing the
@@ -401,12 +401,19 @@ def draw_holdings_section(c, data, generated_date, start_page_num, total_pages):
     note. Pass a `_NullCanvas` as `c` to dry-run this (no drawing, just
     page counting) before the real render.
 
+    `density` (1.0 = normal) scales the vertical spacing between rows and
+    blocks. build() tries progressively tighter values so that a list that
+    overflows by only a few lines stays on one page instead of leaving a
+    nearly empty page behind it; see fit_holdings_density().
+
     Returns the page number of the last page this section used."""
     BOTTOM = 1.0 * inch
     TOP = PAGE_H - 1.65 * inch
     col_value_right = 6.4 * inch
     col_pct_right = PAGE_W - 0.75 * inch
 
+    RH = 15.5 * density          # one holding row
+    FONT = 9.5 if density >= 0.9 else 9.0
     page_num = start_page_num
     y = TOP
 
@@ -462,10 +469,10 @@ def draw_holdings_section(c, data, generated_date, start_page_num, total_pages):
 
         # Keep a category's header glued to at least its first holding row
         # rather than letting it get stranded alone at the bottom of a page.
-        block_h = 32 + 15.5 * len(info["top"])
+        block_h = 32 * density + RH * len(info["top"])
         ensure_room(block_h)
 
-        y -= 10
+        y -= 10 * density
         dot_color = CATEGORY_COLORS.get(cat, "#CFCCC3")
         c.setFillColor(colors.HexColor(dot_color))
         c.circle(0.75 * inch + 4, y - 3.5, 4, stroke=0, fill=1)
@@ -483,23 +490,23 @@ def draw_holdings_section(c, data, generated_date, start_page_num, total_pages):
         else:
             note = f"{count} position{'s' if count != 1 else ''} · all shown"
         c.drawRightString(col_pct_right, y - 8, note)
-        y -= 22
+        y -= 22 * density
 
         c.setStrokeColor(RULE)
         c.setLineWidth(0.6)
         c.line(0.75 * inch, y, PAGE_W - 0.75 * inch, y)
-        y -= 15
+        y -= 15 * density
 
         for h in info["top"]:
-            ensure_room(15.5)
-            name_lines = wrap_text(h["security"], "Helvetica", 9.5, col_value_right - 0.75 * inch - 0.3 * inch)
+            ensure_room(RH)
+            name_lines = wrap_text(h["security"], "Helvetica", FONT, col_value_right - 0.75 * inch - 0.3 * inch)
             c.setFillColor(INK)
-            c.setFont("Helvetica", 9.5)
+            c.setFont("Helvetica", FONT)
             c.drawString(0.75 * inch, y, name_lines[0])
             c.setFillColor(SECONDARY_INK)
             c.drawRightString(col_value_right, y, money(h["market_value"]))
             c.drawRightString(col_pct_right, y, f"{h['allocation_pct']:.2f} %")
-            y -= 15.5
+            y -= RH
 
     # Self-directed holdings -- one small labeled list per self-directed
     # account, kept separate from the managed-account buckets above rather
@@ -507,7 +514,7 @@ def draw_holdings_section(c, data, generated_date, start_page_num, total_pages):
     # part of White Oak's asset allocation). See "self-directed accounts"
     # skill note.
     for sd in data.get("self_directed", []):
-        block_h = 14 + 22 + 15 + 15.5 * len(sd.get("top_holdings", [])) + 14
+        block_h = 14 + 22 + 15 + RH * len(sd.get("top_holdings", [])) + 14
         ensure_room(block_h)
 
         y -= 14
@@ -522,23 +529,23 @@ def draw_holdings_section(c, data, generated_date, start_page_num, total_pages):
         c.setFillColor(MUTED)
         c.setFont("Helvetica", 8.5)
         c.drawRightString(col_pct_right, y - 8, f"{money(sd['total_value'])} · {ret_str} for the period")
-        y -= 22
+        y -= 22 * density
 
         c.setStrokeColor(RULE)
         c.setLineWidth(0.6)
         c.line(0.75 * inch, y, PAGE_W - 0.75 * inch, y)
-        y -= 15
+        y -= 15 * density
 
         for h in sd.get("top_holdings", []):
-            ensure_room(15.5)
-            name_lines = wrap_text(h["security"], "Helvetica", 9.5, col_value_right - 0.75 * inch - 0.3 * inch)
+            ensure_room(RH)
+            name_lines = wrap_text(h["security"], "Helvetica", FONT, col_value_right - 0.75 * inch - 0.3 * inch)
             c.setFillColor(INK)
-            c.setFont("Helvetica", 9.5)
+            c.setFont("Helvetica", FONT)
             c.drawString(0.75 * inch, y, name_lines[0])
             c.setFillColor(SECONDARY_INK)
             c.drawRightString(col_value_right, y, money(h["market_value"]))
             c.drawRightString(col_pct_right, y, f"{h['allocation_pct']:.2f} %")
-            y -= 15.5
+            y -= RH
 
         c.setFillColor(MUTED)
         c.setFont("Helvetica-Oblique", 7.8)
@@ -548,6 +555,26 @@ def draw_holdings_section(c, data, generated_date, start_page_num, total_pages):
     draw_footer(c, page_num, total_pages, generated_date)
     c.showPage()
     return page_num
+
+
+def fit_holdings_density(data, generated_date, start_page_num=2):
+    """Picks the loosest spacing at which the Holdings section fits on a
+    single page. A list that runs only a line or two over a page used to
+    spill onto its own nearly empty page (and push the performance page to
+    page 4); tightening row spacing a little keeps it on one page. If even
+    the tightest setting doesn't fit (a genuinely long list, e.g. with
+    self-directed blocks), normal spacing is used and it paginates as
+    before. Returns (density, last_page_number)."""
+    natural = draw_holdings_section(_NullCanvas(), data, generated_date,
+                                    start_page_num=start_page_num, total_pages=0)
+    if natural == start_page_num:
+        return 1.0, natural
+    for d in (0.95, 0.90, 0.85, 0.80):
+        end = draw_holdings_section(_NullCanvas(), data, generated_date,
+                                    start_page_num=start_page_num, total_pages=0, density=d)
+        if end == start_page_num:
+            return d, end
+    return 1.0, natural
 
 
 def build(input_pdf, output_pdf, workdir, registration_overrides=None, perf_page_index=None,
@@ -653,8 +680,7 @@ def build(input_pdf, output_pdf, workdir, registration_overrides=None, perf_page
     # self-directed account -- see draw_holdings_section). Page 1's own
     # footer needs the final page count, so silently dry-run the Holdings
     # section first to find it before drawing anything for real.
-    holdings_dry_end = draw_holdings_section(_NullCanvas(), data, generated_date,
-                                              start_page_num=2, total_pages=0)
+    holdings_density, holdings_dry_end = fit_holdings_density(data, generated_date, start_page_num=2)
     total_pages = holdings_dry_end + 1  # +1 for the closing Performance/Gain-Loss page
 
     c = canvas.Canvas(output_pdf, pagesize=letter)
@@ -805,7 +831,8 @@ def build(input_pdf, output_pdf, workdir, registration_overrides=None, perf_page
 
     # ---------------------------------------------------------- PAGE 2+ ---
     holdings_end_page = draw_holdings_section(c, data, generated_date,
-                                               start_page_num=2, total_pages=total_pages)
+                                               start_page_num=2, total_pages=total_pages,
+                                               density=holdings_density)
 
     # -------------------------------------------- FINAL (PERFORMANCE) PAGE
     final_page_num = holdings_end_page + 1
