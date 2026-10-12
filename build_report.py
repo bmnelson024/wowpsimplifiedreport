@@ -141,18 +141,56 @@ def draw_header(c, client_name, period_start, period_end, advisor):
     c.line(0.75 * inch, PAGE_H - 1.22 * inch, PAGE_W - 0.75 * inch, PAGE_H - 1.22 * inch)
 
 
+def custodial_number(account_number):
+    """The custodial account number a sleeved account belongs to, or None if
+    this isn't a sleeve. Orion numbers a sleeve as '<custodial number>_<sleeve>'
+    (e.g. 'XXXXXXX4_DIV', 'XXXXXXXX_CORE'); everything before the first '_'
+    is the real account."""
+    n = (account_number or "").strip()
+    return n.split("_", 1)[0] if "_" in n else None
+
+
 def group_accounts(accounts):
-    """Rolls Orion's internal per-sleeve account rows up to one row per real
-    household registration -- a client doesn't need to see that their joint
-    account is internally split into a core/dividend/legacy sleeve."""
+    """One row per real account, never one per sleeve.
+
+    Brian's rule (2026-10-12): any account number containing '_' is a sleeve
+    of the custodial account named by the part before the underscore, and the
+    sleeves roll up into that one account -- including a self-directed sleeve
+    (McSwain's '..._XXGACY'); the self-directed holdings are still itemised in
+    their own section further down the report. A plain account whose number
+    equals a sleeve's custodial number joins that group too.
+
+    Orion sometimes masks the whole custodial part ('XXXXXXXX_CORE'). With no
+    visible digit there is nothing to tell two different accounts apart, so
+    those sleeves only roll up when their registration also matches --
+    otherwise two unrelated masked accounts would be merged into one.
+
+    Accounts without an underscore keep the older behaviour: rows with the
+    same registration are combined, and a self-directed account is never
+    folded into a managed account that happens to share its name."""
+    sleeve_roots = set()
+    for a in accounts:
+        root = custodial_number(a["account_number"])
+        if root is not None:
+            sleeve_roots.add(root)
+
+    def key_for(a):
+        num = (a["account_number"] or "").strip()
+        root = custodial_number(num)
+        if root is not None:
+            return ("custodial", root) if any(ch.isdigit() for ch in root) else ("custodial", root, a["registration"])
+        if num in sleeve_roots:
+            return ("custodial", num)
+        return ("registration", a["registration"], bool(a.get("self_directed")))
+
     groups, order = {}, []
     for a in accounts:
-        # Self-directed accounts never merge with a managed account, even
-        # when Orion gives both the same display registration (McSwain).
-        key = (a["registration"], bool(a.get("self_directed")))
+        key = key_for(a)
         if key not in groups:
+            is_custodial = key[0] == "custodial"
             groups[key] = {"registration": a["registration"], "type": a["type"], "value": 0.0,
-                           "count": 0, "self_directed": bool(a.get("self_directed"))}
+                           "count": 0, "custodial": is_custodial,
+                           "self_directed": (not is_custodial) and bool(a.get("self_directed"))}
             order.append(key)
         groups[key]["value"] += a["value"]
         groups[key]["count"] += 1
@@ -208,7 +246,9 @@ def draw_accounts_section(c, top_y, data):
         c.setFont("Helvetica", 9.5)
         for i, ln in enumerate(name_lines):
             c.drawString(col_x[0], row_y - i * 11, ln)
-        if g.get("self_directed") or g["count"] > 1:
+        # A rolled-up custodial account is just one account to the client: no
+        # "N accounts combined" note (that is only for same-name plain accounts).
+        if g.get("self_directed") or (g["count"] > 1 and not g.get("custodial")):
             c.setFillColor(MUTED)
             c.setFont("Helvetica-Oblique" if g.get("self_directed") else "Helvetica", 8)
             sub = ("Self-directed · invested at the client's direction" if g.get("self_directed")
