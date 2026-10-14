@@ -157,11 +157,52 @@ def _page_text(pdf, i):
     return cache[i]
 
 
+def _poppler_pages(pdf):
+    """Cheap per-page look-ahead: poppler's pdftotext reads the whole file in about a
+    second (pdfplumber needs ~0.3s PER PAGE on the dense pages). Returns, per page, a
+    list of stripped non-empty lines, or None if pdftotext isn't
+    available or fails. This is ONLY used to NARROW DOWN which pages to examine; every
+    page it points at is still checked with the original pdfplumber logic, and callers
+    fall back to the old full scan if it finds nothing, so results do not change."""
+    cache = pdf.__dict__
+    if "_wo_poppler" in cache:
+        return cache["_wo_poppler"]
+    pages = None
+    try:
+        path = str(getattr(pdf, "path", "") or "")
+        if path:
+            out = subprocess.run(["pdftotext", "-layout", path, "-"], check=True, capture_output=True, timeout=60)
+            raw = out.stdout.decode("utf-8", errors="replace").split("\f")
+            if raw and not raw[-1].strip():
+                raw = raw[:-1]
+            if len(raw) == len(pdf.pages):
+                pages = [[l.strip() for l in pg.split("\n") if l.strip()] for pg in raw]
+    except Exception:
+        pages = None
+    cache["_wo_poppler"] = pages
+    return pages
+
+
+def _poppler_candidates(pdf, predicate):
+    """Page indexes (ascending) whose poppler lines satisfy `predicate(lines)`,
+    or None when poppler gave nothing usable (caller then scans every page)."""
+    pages = _poppler_pages(pdf)
+    if pages is None:
+        return None
+    return [i for i, lines in enumerate(pages) if predicate(lines)]
+
+
 def _find_section_page(pdf, title):
-    for i in range(len(pdf.pages)):
-        text = _page_text(pdf, i)
-        lines = [l.strip() for l in text.split("\n")[:4]]
-        if title in lines:
+    def has_title(i):
+        lines = [l.strip() for l in _page_text(pdf, i).split("\n")[:4]]
+        return title in lines
+
+    cand = _poppler_candidates(pdf, lambda lines: title in lines)
+    for i in (cand or []):
+        if has_title(i):
+            return i
+    for i in range(len(pdf.pages)):       # poppler unavailable or found nothing: original full scan
+        if has_title(i):
             return i
     return None
 
@@ -291,15 +332,26 @@ def extract_gain_loss_summary(pdf):
     def _grand_total_row(start, stop):
         if start is None:
             return None
-        for i in range(start, stop):
-            for t in pdf.pages[i].extract_tables():
-                for row in t:
-                    if not row or row[0] is None or len(row) < 7:
-                        continue
-                    label = _dedupe_pairs(_clean_label(row[0])).lower()
-                    if label == "total:":
-                        return row
-        return None
+
+        def scan(pages):
+            for i in pages:
+                for t in pdf.pages[i].extract_tables():
+                    for row in t:
+                        if not row or row[0] is None or len(row) < 7:
+                            continue
+                        label = _dedupe_pairs(_clean_label(row[0])).lower()
+                        if label == "total:":
+                            return row
+            return None
+
+        # poppler narrows the pages to those that show a 'Total' line (the full
+        # table parse is the expensive part); fall back to every page in range.
+        cand = _poppler_candidates(pdf, lambda lines: any(l.startswith("Total:") for l in lines))
+        if cand is not None:
+            row = scan([i for i in cand if start <= i < stop])
+            if row is not None:
+                return row
+        return scan(range(start, stop))
 
     result = {"realized_gain": None, "unrealized_gain": None}
 
@@ -323,15 +375,8 @@ def extract_total_return(pdf):
     Gain/Loss"). That row is bold/doubled like other Orion total rows, but
     is distinguishable from each account's own subtotal because it starts
     with a bare 'Total:' with no registration name in front of it."""
-    start = end = None
-    for i in range(len(pdf.pages)):
-        lines = [l.strip() for l in _page_text(pdf, i).split("\n")[:4]]
-        if "Performance" in lines and start is None:
-            start = i
-        if "Realized Gain/Loss" in lines and end is None:
-            end = i
-        if start is not None and end is not None:
-            break          # both section markers found (first match wins, as before): no need to parse the rest
+    start = _find_section_page(pdf, "Performance")
+    end = _find_section_page(pdf, "Realized Gain/Loss")
     if start is None:
         return None
     if end is None:
@@ -340,16 +385,24 @@ def extract_total_return(pdf):
     pattern = re.compile(
         r"^Total:\s*\$([\d,]+\.\d{2})\s+\$([\d,]+\.\d{2})\s+\$([\d,]+\.\d{2})\s+(-?[\d.]+)\s*%$"
     )
-    for i in range(start, end):
-        text = _page_text(pdf, i)
-        for line in text.split("\n"):
-            ls = line.strip()
-            if ls.startswith("TToottaall::"):
-                deduped = _dedupe_pairs(ls)
-                m = pattern.match(deduped)
-                if m:
-                    return float(m.group(4))
-    return None
+    def search(pages):
+        for i in pages:
+            for line in _page_text(pdf, i).split("\n"):
+                ls = line.strip()
+                if ls.startswith("TToottaall::"):
+                    m = pattern.match(_dedupe_pairs(ls))
+                    if m:
+                        return float(m.group(4))
+        return None
+
+    # Only pages poppler shows a 'Total' line on can hold the grand-total row; then,
+    # if that somehow finds nothing, fall back to every page in the section.
+    cand = _poppler_candidates(pdf, lambda lines: any(l.startswith("Total:") for l in lines))
+    if cand is not None:
+        r = search([i for i in cand if start <= i < end])
+        if r is not None:
+            return r
+    return search(range(start, end))
 
 
 def extract_benchmark_legend(pdf, client_name):
@@ -365,7 +418,10 @@ def extract_benchmark_legend(pdf, client_name):
     labels since only the third (custom blend) label actually varies;
     returns None if the legend line isn't found, so the caller can fall
     back to a generic caption instead of guessing."""
-    for i in range(len(pdf.pages)):
+    cand = _poppler_candidates(
+        pdf, lambda lines: any("Morningstar US Core Bond" in l and "S&P 500" in l for l in lines))
+    pages_to_scan = cand if cand is not None else range(len(pdf.pages))
+    for i in pages_to_scan:
         text = _page_text(pdf, i)
         for line in text.split("\n"):
             if "Morningstar US Core Bond" in line and "S&P 500" in line:
@@ -492,11 +548,20 @@ def _find_candidate_chart_page(pdf):
 
 
 def _find_candidate_chart_page_uncached(pdf):
-    for i in range(len(pdf.pages)):
-        text = _page_text(pdf, i)
-        lines = [l.strip() for l in text.split("\n")[:4]]
-        for line in lines:
-            if line.lower().startswith("performance") and "benchmark" in line.lower():
+    def is_chart_page(i):
+        lines = [l.strip() for l in _page_text(pdf, i).split("\n")[:4]]
+        return any(l.lower().startswith("performance") and "benchmark" in l.lower() for l in lines)
+
+    cand = _poppler_candidates(pdf, lambda lines: any(l.lower().startswith("performance") and "benchmark" in l.lower() for l in lines))
+    if cand is not None:
+        # poppler sees every line of every page, so a page it does not list cannot
+        # be the chart page -- no need to parse the other ~70 pages with pdfplumber.
+        for i in cand:
+            if is_chart_page(i):
+                return i
+    else:
+        for i in range(len(pdf.pages)):   # poppler unavailable: original full scan
+            if is_chart_page(i):
                 return i
     # Fall back to the bare "Performance" section if no more specific title
     # is found -- better to point at *a* performance-related page than fail
