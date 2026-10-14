@@ -144,8 +144,9 @@ def draw_header(c, client_name, period_start, period_end, advisor):
 def custodial_number(account_number):
     """The custodial account number a sleeved account belongs to, or None if
     this isn't a sleeve. Orion numbers a sleeve as '<custodial number>_<sleeve>'
-    (e.g. 'XXXXXXX4_DIV', 'XXXXXXXX_CORE'); everything before the first '_'
-    is the real account."""
+    (e.g. 'XXXXXXX6_DIV', 'XXXXXXXX_CORE'); everything before the first '_'
+    is the real account -- but Orion masks it, so it is not usable as a key
+    (see group_accounts)."""
     n = (account_number or "").strip()
     return n.split("_", 1)[0] if "_" in n else None
 
@@ -154,33 +155,33 @@ def group_accounts(accounts):
     """One row per real account, never one per sleeve.
 
     Brian's rule (2026-10-12): any account number containing '_' is a sleeve
-    of the custodial account named by the part before the underscore, and the
-    sleeves roll up into that one account -- including a self-directed sleeve
-    (McSwain's '..._XXGACY'); the self-directed holdings are still itemised in
-    their own section further down the report. A plain account whose number
-    equals a sleeve's custodial number joins that group too.
+    of a custodial account, and the sleeves roll up into that one account --
+    including a self-directed sleeve (McSwain's '..._XXGACY'); the
+    self-directed holdings are still itemised in their own section further
+    down the report.
 
-    Orion sometimes masks the whole custodial part ('XXXXXXXX_CORE'). With no
-    visible digit there is nothing to tell two different accounts apart, so
-    those sleeves only roll up when their registration also matches --
-    otherwise two unrelated masked accounts would be merged into one.
+    How sleeves are matched: by registration text, NOT by the number before
+    the underscore. Orion masks all but the last few characters of the whole
+    string, so the custodial part is usually fully masked ('XXXXXXXX_CORE',
+    'XXXXXXXX_XXGACY') and sometimes leaks a single digit ('XXXXXXX6_DIV'),
+    which would split one trust's DIV sleeve from its CORE and LEGACY sleeves
+    (seen on the Van Tassel multi-registration export). Every sleeve of one
+    custodial account shares the registration, so registration is the reliable
+    key. A plain account (no underscore) joins a sleeve group only when its
+    full number equals the sleeve's custodial part.
 
     Accounts without an underscore keep the older behaviour: rows with the
     same registration are combined, and a self-directed account is never
     folded into a managed account that happens to share its name."""
-    sleeve_roots = set()
-    for a in accounts:
-        root = custodial_number(a["account_number"])
-        if root is not None:
-            sleeve_roots.add(root)
+    sleeve_roots = {custodial_number(a["account_number"]) for a in accounts
+                    if custodial_number(a["account_number"]) is not None}
 
     def key_for(a):
         num = (a["account_number"] or "").strip()
-        root = custodial_number(num)
-        if root is not None:
-            return ("custodial", root) if any(ch.isdigit() for ch in root) else ("custodial", root, a["registration"])
+        if custodial_number(num) is not None:
+            return ("custodial", a["registration"])
         if num in sleeve_roots:
-            return ("custodial", num)
+            return ("custodial", a["registration"])
         return ("registration", a["registration"], bool(a.get("self_directed")))
 
     groups, order = {}, []
