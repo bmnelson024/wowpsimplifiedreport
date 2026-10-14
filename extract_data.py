@@ -142,9 +142,24 @@ def top_allocation_breakdown(allocation_rows, top_n=7):
     return out
 
 
+def _page_text(pdf, i):
+    """A page's text, parsed ONCE per PDF and kept as a plain string. Every scan
+    that only needs text (finding the Performance / Gain-Loss pages, the chart
+    page, the benchmark legend, the total-return row) goes through here:
+    pdfplumber re-parses a page from scratch on every extract_text() call once
+    its cache is dropped, and these scans used to parse each page up to a dozen
+    times -- ~35s of CPU on a 73-page export, enough to hit the 120s worker
+    timeout on Render's slow free CPU (the browser then reports "Failed to
+    fetch"). Strings are tiny; the parsed page objects are what cost memory."""
+    cache = pdf.__dict__.setdefault("_wo_page_text", {})
+    if i not in cache:
+        cache[i] = pdf.pages[i].extract_text() or ""
+    return cache[i]
+
+
 def _find_section_page(pdf, title):
-    for i, page in enumerate(pdf.pages):
-        text = page.extract_text() or ""
+    for i in range(len(pdf.pages)):
+        text = _page_text(pdf, i)
         lines = [l.strip() for l in text.split("\n")[:4]]
         if title in lines:
             return i
@@ -160,6 +175,10 @@ def _all_holdings(pdf):
     -- all skipped. Rows are identified by their column count (10) so we
     don't accidentally sweep in the Portfolio Overview accounts table,
     which shares the same page range but has a different shape."""
+    cached = pdf.__dict__.get("_wo_holdings")
+    if cached is not None:
+        return [dict(h) for h in cached]   # copies: callers sort/slice their own list
+
     performance_start = _find_section_page(pdf, "Performance")
     end = performance_start if performance_start is not None else len(pdf.pages)
 
@@ -191,6 +210,7 @@ def _all_holdings(pdf):
                     "allocation_pct": _pct(row[5]),
                     "section": current_section,
                 })
+    pdf.__dict__["_wo_holdings"] = [dict(h) for h in holdings]
     return holdings
 
 
@@ -304,13 +324,14 @@ def extract_total_return(pdf):
     is distinguishable from each account's own subtotal because it starts
     with a bare 'Total:' with no registration name in front of it."""
     start = end = None
-    for i, page in enumerate(pdf.pages):
-        text = page.extract_text() or ""
-        lines = [l.strip() for l in text.split("\n")[:4]]
+    for i in range(len(pdf.pages)):
+        lines = [l.strip() for l in _page_text(pdf, i).split("\n")[:4]]
         if "Performance" in lines and start is None:
             start = i
         if "Realized Gain/Loss" in lines and end is None:
             end = i
+        if start is not None and end is not None:
+            break          # both section markers found (first match wins, as before): no need to parse the rest
     if start is None:
         return None
     if end is None:
@@ -320,7 +341,7 @@ def extract_total_return(pdf):
         r"^Total:\s*\$([\d,]+\.\d{2})\s+\$([\d,]+\.\d{2})\s+\$([\d,]+\.\d{2})\s+(-?[\d.]+)\s*%$"
     )
     for i in range(start, end):
-        text = pdf.pages[i].extract_text() or ""
+        text = _page_text(pdf, i)
         for line in text.split("\n"):
             ls = line.strip()
             if ls.startswith("TToottaall::"):
@@ -344,8 +365,8 @@ def extract_benchmark_legend(pdf, client_name):
     labels since only the third (custom blend) label actually varies;
     returns None if the legend line isn't found, so the caller can fall
     back to a generic caption instead of guessing."""
-    for page in pdf.pages:
-        text = page.extract_text() or ""
+    for i in range(len(pdf.pages)):
+        text = _page_text(pdf, i)
         for line in text.split("\n"):
             if "Morningstar US Core Bond" in line and "S&P 500" in line:
                 rest = line.replace(client_name, "").strip()
@@ -444,9 +465,35 @@ NAVY_TOL = 45
 CHART_CROP_DPI = 300
 
 
+_CHART_PAGE_CACHE = {}
+
+
 def _find_candidate_chart_page(pdf):
-    for i, page in enumerate(pdf.pages):
-        text = page.extract_text() or ""
+    """Index of the 'Performance And Benchmark' chart page. Both the benchmark-returns
+    table and the chart crop need it, each with its own pdfplumber handle on the same
+    file, and finding it parses every page up to the chart (the dense holdings pages
+    are the slow ones), so remember the answer per file (path + size + mtime)."""
+    key = None
+    try:
+        path = str(getattr(pdf, "path", "") or "")
+        if path:
+            st = os.stat(path)
+            key = (path, st.st_size, st.st_mtime_ns)
+    except OSError:
+        key = None
+    if key is not None and key in _CHART_PAGE_CACHE:
+        return _CHART_PAGE_CACHE[key]
+    idx = _find_candidate_chart_page_uncached(pdf)
+    if key is not None:
+        _CHART_PAGE_CACHE[key] = idx
+        if len(_CHART_PAGE_CACHE) > 32:                      # long-running server: keep it bounded
+            _CHART_PAGE_CACHE.pop(next(iter(_CHART_PAGE_CACHE)))
+    return idx
+
+
+def _find_candidate_chart_page_uncached(pdf):
+    for i in range(len(pdf.pages)):
+        text = _page_text(pdf, i)
         lines = [l.strip() for l in text.split("\n")[:4]]
         for line in lines:
             if line.lower().startswith("performance") and "benchmark" in line.lower():
@@ -605,6 +652,11 @@ def _install_page_cache_release():
             finally:
                 try:
                     self.flush_cache()
+                    # pdfplumber also memoises each page's last text map (it holds
+                    # every character of the page) in a per-page lru_cache that
+                    # flush_cache() does not touch: ~3MB per page, ~215MB on a
+                    # 73-page export (2026-10-12, Van Tassel). Clear it too.
+                    self.get_textmap.cache_clear()
                 except Exception:
                     pass
         inner.__name__ = orig.__name__
