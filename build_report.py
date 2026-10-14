@@ -806,13 +806,52 @@ def draw_page1_body(c, data, donut_path, classification_path, level=0):
         "Equities, fixed income, and cash balances are rolled up from individual holdings across all accounts.",
         "Helvetica-Oblique", 8, col_w)
     note2_lines = wrap_text(
-        "Shows the largest classifications; smaller ones are grouped as Other.",
+        "Shows the largest classifications; the smaller ones are grouped together.",
         "Helvetica-Oblique", 8, col_w)
     for i, ln in enumerate(note1_lines):
         c.drawString(col1_x, note_y - i * 10, ln)
     for i, ln in enumerate(note2_lines):
         c.drawString(col2_x, note_y - i * 10, ln)
     return note_y - 10 * (max(len(note1_lines), len(note2_lines)) - 1) - 8
+
+
+def other_holdings_note(data, max_names=6):
+    """Names the holdings Orion files outside Equity / Bond / Money Market (the report's "Other"
+    asset class), so they can be classified in Orion and the report re-run. None when there are none."""
+    other = (data.get("holdings_by_category") or {}).get("Other")
+    if not other or not other.get("count"):
+        return None
+    items = other.get("top") or []
+    names = "; ".join(f"{h['security']} (${h['market_value']:,.0f})" for h in items[:max_names])
+    more = other["count"] - min(len(items), max_names)
+    return (f"{other['count']} holding(s) worth ${other['total_value']:,.0f} are in Orion's \"Other\" asset class - "
+            f"classify them in Orion and re-run: {names}" + (f"; and {more} more" if more > 0 else "") + ".")
+
+
+def reconcile_allocation_buckets(data):
+    """Compare the label-based four-bucket split with Orion's own Portfolio Appraisal section
+    totals. When they agree, nothing changes. When they differ (a new Orion label in the wrong
+    bucket, or Orion filing a fund under a different class in its labels than in its appraisal --
+    e.g. "Multistrategy" / "Sector Equity" funds that the appraisal lists under Equity), the
+    appraisal totals win -- provided they add up to the portfolio value -- so the donut agrees
+    with the Holdings page. Mutates data["allocation_buckets"]; returns a note for the
+    X-Report-Warnings header, or None."""
+    appraisal = data.get("appraisal_totals")
+    if not appraisal:
+        return None
+    buckets = data.get("allocation_buckets", {})
+    total = data.get("total_value") or 0
+    tol = max(5.0, 0.0005 * total)
+    off = [f"{k}: labels {buckets.get(k, 0):,.0f} vs appraisal {appraisal.get(k, 0):,.0f}"
+           for k in sorted(set(buckets) | set(appraisal)) if abs(buckets.get(k, 0) - appraisal.get(k, 0)) > tol]
+    if not off:
+        return None
+    if total and abs(sum(appraisal.values()) - total) <= tol:
+        data["allocation_buckets"] = dict(appraisal)
+        return ("Asset allocation by class follows Orion's Portfolio Appraisal totals; Orion's allocation labels split it "
+                "differently (" + "; ".join(off) + ").")
+    return ("Asset allocation by class doesn't match Orion's Portfolio Appraisal totals (" + "; ".join(off)
+            + ") - an Orion allocation label may need mapping.")
 
 
 def build(input_pdf, output_pdf, workdir, registration_overrides=None, perf_page_index=None,
@@ -894,18 +933,15 @@ def build(input_pdf, output_pdf, workdir, registration_overrides=None, perf_page
     generated_date = datetime.now().strftime("%m/%d/%Y")
 
     warnings = []
-    # Safety net: the four-bucket split (built from Orion's allocation labels) must agree with the
-    # section totals in Orion's own Portfolio Appraisal. A new/unknown label that lands in the wrong
-    # bucket would otherwise silently skew the asset-allocation donut.
-    appraisal = data.get("appraisal_totals")
-    if appraisal:
-        buckets = data.get("allocation_buckets", {})
-        tol = max(5.0, 0.0005 * (data.get("total_value") or 0))
-        off = [f"{k}: report {buckets.get(k, 0):,.0f} vs Orion {appraisal.get(k, 0):,.0f}"
-               for k in sorted(set(buckets) | set(appraisal)) if abs(buckets.get(k, 0) - appraisal.get(k, 0)) > tol]
-        if off:
-            warnings.append("Asset allocation by class doesn't match Orion's Portfolio Appraisal totals (" + "; ".join(off)
-                            + ") - an Orion allocation label may need mapping.")
+    # The four-bucket split is built from Orion's allocation LABELS; Orion's Portfolio Appraisal
+    # section totals (Equity / Bond / Money Market / Alternatives) are what the Holdings page is
+    # built from. Keep the two consistent -- see reconcile_allocation_buckets().
+    note = reconcile_allocation_buckets(data)
+    if note:
+        warnings.append(note)
+    other_note = other_holdings_note(data)
+    if other_note:
+        warnings.append(other_note)
     donut_path = os.path.join(workdir, "allocation_donut.png")
     build_donut(data["allocation_buckets"], donut_path, data["total_value"])
 

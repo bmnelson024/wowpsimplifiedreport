@@ -123,7 +123,7 @@ def categorize(label):
     return CATEGORY_MAP.get(key, "Other")
 
 
-def top_allocation_breakdown(allocation_rows, top_n=7):
+def top_allocation_breakdown(allocation_rows, top_n=8):
     """Orion's raw Allocation Overview rows (Large Cap, Mid Cap, High Yield
     Bond, etc. -- the granular labels behind the 4-bucket rollup) sorted by
     value descending, keeping the largest `top_n` individually and folding
@@ -152,8 +152,11 @@ def top_allocation_breakdown(allocation_rows, top_n=7):
         for r in kept
     ]
     if rest:
+        # "Other" reads as "unclassified"; the folded row is just the small classes lumped together,
+        # so call it that -- unless it is made up only of Orion's own "Other*" line.
+        only_orion_other = all(r in own_other for r in rest)
         out.append({
-            "label": "Other",
+            "label": "Other" if only_orion_other else "Smaller classes",
             "value": sum(r["value"] for r in rest),
             "pct": sum(r["pct"] for r in rest),
             "parent": "Other",
@@ -893,7 +896,7 @@ def extract(pdf_path):
             cat = categorize(row["label"])
             buckets[cat] = buckets.get(cat, 0.0) + row["value"]
         data["allocation_buckets"] = buckets
-        data["allocation_breakdown"] = top_allocation_breakdown(allocation_rows, top_n=7)
+        data["allocation_breakdown"] = top_allocation_breakdown(allocation_rows, top_n=8)
 
         # Portfolio Overview (accounts). Page position is NOT stable across
         # report scopes -- it's page 3 (index 2) for a full household export
