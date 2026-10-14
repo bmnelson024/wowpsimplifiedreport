@@ -622,7 +622,7 @@ def build(input_pdf, output_pdf, workdir, registration_overrides=None, perf_page
           perf_crop_box=None, perf_bottom_trim=None,
           managed_pdf=None, selfdirected_pdfs=None,
           managed_perf_page_index=None, managed_perf_crop_box=None, managed_perf_bottom_trim=0,
-          rmd=None):
+          rmd=None, client_name_override=None):
     """workdir: a directory for this request's intermediate files (charts,
     cropped PDF). Must be unique per concurrent request.
 
@@ -632,6 +632,9 @@ def build(input_pdf, output_pdf, workdir, registration_overrides=None, perf_page
     crop box to override for one client (original point-space method).
 
     Returns {"data": <extracted data dict>, "warnings": [str, ...]}.
+
+    client_name_override: optional name to print on the report (header on every
+    page) and use for the file name, instead of the name in the Orion export.
 
     rmd: optional list of per-account Required Minimum Distribution dicts
     ({"account", "required", "taken", optional "year"/"deadline"/"as_of"}),
@@ -678,6 +681,12 @@ def build(input_pdf, output_pdf, workdir, registration_overrides=None, perf_page
         # from the figures above" wording would be false.
         raise ValueError("selfdirected_pdfs requires managed_pdf (the all-but-self-directed export).")
     data = build_combined_data(input_pdf, managed_pdf=managed_pdf, selfdirected_pdfs=selfdirected_pdfs)
+    # Orion titles a custom multi-account group export with the group's own name
+    # (e.g. "6 Registrations"), which is meaningless to the client -- let the caller
+    # supply the real name. Applied after extraction, so nothing that reads the
+    # Orion report (benchmark legend etc.) is affected.
+    if client_name_override and client_name_override.strip():
+        data["client_name"] = " ".join(client_name_override.split())
     sd_numbers = {n for sd in data.get("self_directed", []) for n in sd.get("account_numbers", [])}
     for a in data["accounts"]:
         a["self_directed"] = a["account_number"] in sd_numbers

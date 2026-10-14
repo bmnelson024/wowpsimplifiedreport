@@ -102,6 +102,10 @@ def generate_report():
         return jsonify({"error": "The self-directed split needs both 'managed_pdf' (the all-but-self-directed "
                                  "export) and at least one 'selfdirected_pdfs' file."}), 400
 
+    # Optional: the name to print on the report instead of Orion's group name
+    # (a custom multi-account export is titled e.g. "6 Registrations").
+    client_name_override = " ".join((request.form.get("client_name") or "").split())[:120] or None
+
     # Optional RMD rows (manually entered -- not in the Orion export).
     rmd = None
     rmd_raw = request.form.get("rmd")
@@ -147,7 +151,8 @@ def generate_report():
             result = build(input_pdf, output_pdf, workdir,
                            managed_pdf=managed_pdf,
                            selfdirected_pdfs=selfdirected_pdfs or None,
-                           rmd=rmd)
+                           rmd=rmd,
+                           client_name_override=client_name_override)
         except Exception as e:
             app.logger.error("Report generation failed: %s\n%s", e, traceback.format_exc())
             return jsonify({
@@ -157,7 +162,7 @@ def generate_report():
 
         client_name = result["data"].get("client_name", "Client")
         warnings = result.get("warnings", [])
-        safe_name = "".join(c if c.isalnum() or c in " -_" else "_" for c in client_name).strip() or "Client"
+        safe_name = "".join(c if c.isalnum() or c in " -_" else "_" for c in client_name.replace("&", "and")).strip() or "Client"
         download_name = f"{safe_name}_Simplified_Review.pdf"
 
         # Read the file into memory before the temp directory is cleaned up
@@ -176,7 +181,10 @@ def generate_report():
     )
     if warnings:
         resp.headers["X-Report-Warnings"] = " | ".join(warnings)
-    resp.headers["X-Report-Client"] = client_name
+    # HTTP headers are latin-1 only; a name with other characters must not crash the response.
+    import unicodedata
+    ascii_name = unicodedata.normalize("NFKD", client_name).encode("ascii", "ignore").decode("ascii").strip()
+    resp.headers["X-Report-Client"] = ascii_name or "Client"
     return resp
 
 
