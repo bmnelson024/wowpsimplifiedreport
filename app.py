@@ -41,12 +41,17 @@ the automatic performance-chart detection ran into is surfaced as an
 "X-Report-Warnings" response header (informational only -- it does not
 block the response) so the front-end can optionally show a heads-up.
 """
+import gc
+import hmac
+import io
 import json
+import logging
 import os
 import tempfile
 import traceback
+import unicodedata
 
-from flask import Flask, request, send_file, jsonify, after_this_request
+from flask import Flask, request, send_file, jsonify
 
 from build_report import build
 
@@ -57,6 +62,35 @@ REPORT_API_KEY = os.environ.get("REPORT_API_KEY")  # required in production
 MAX_UPLOAD_BYTES = 100 * 1024 * 1024  # 100MB total -- up to ~4 Orion exports (a few MB each) per request
 
 app.config["MAX_CONTENT_LENGTH"] = MAX_UPLOAD_BYTES
+
+if not REPORT_API_KEY:
+    logging.getLogger(__name__).warning(
+        "REPORT_API_KEY is not set: /generate-report accepts requests from anyone. "
+        "Set it (and the same value in the Review Tool) on the host.")
+if ALLOWED_ORIGIN == "*":
+    logging.getLogger(__name__).warning(
+        "ALLOWED_ORIGIN is not set: any website's browser code may call this service. "
+        "Set it to the Review Tool's Netlify address.")
+
+
+_PUNCT = {"\u2018": "'", "\u2019": "'", "\u201c": '"', "\u201d": '"', "\u2013": "-", "\u2014": "-", "\u2026": "...", "\u00a0": " "}
+
+
+def header_safe(text, limit=1800):
+    """Make text safe for an HTTP header: ASCII only, one line, bounded length.
+
+    Servers (gunicorn included) refuse headers with characters outside latin-1 and drop the
+    connection, which the browser reports as "Failed to fetch" even though the report was built.
+    Fund names with curly apostrophes or dashes would otherwise trigger that."""
+    text = "".join(_PUNCT.get(ch, ch) for ch in str(text))
+    text = unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode("ascii")
+    text = " ".join(text.split())
+    return text if len(text) <= limit else text[: limit - 3].rstrip() + "..."
+
+
+@app.errorhandler(413)
+def too_large(_e):
+    return jsonify({"error": "That upload is too large (limit %d MB in total)." % (MAX_UPLOAD_BYTES // (1024 * 1024))}), 413
 
 
 @app.after_request
@@ -83,7 +117,8 @@ def generate_report_preflight():
 def generate_report():
     if REPORT_API_KEY:
         supplied = request.headers.get("X-Report-Key", "")
-        if supplied != REPORT_API_KEY:
+        # Constant-time comparison (bytes, so a non-ASCII header cannot raise).
+        if not hmac.compare_digest(supplied.encode("utf-8", "replace"), REPORT_API_KEY.encode("utf-8")):
             return jsonify({"error": "Unauthorized"}), 401
 
     if "orion_pdf" not in request.files:
@@ -132,6 +167,15 @@ def generate_report():
             return jsonify({"error": "Could not read the RMD rows (each needs an account name and a "
                                      "required amount of zero or more)."}), 400
 
+    # Reject anything that is clearly not a PDF before spending time on it.
+    for f in [uploaded, managed_upload, *sd_uploads]:
+        if f is None:
+            continue
+        head = f.stream.read(1024)
+        f.stream.seek(0)
+        if b"%PDF-" not in head:
+            return jsonify({"error": "'%s' does not look like a PDF file." % (f.filename or "upload")[:80]}), 400
+
     with tempfile.TemporaryDirectory(prefix="wo_report_") as workdir:
         input_pdf = os.path.join(workdir, "input.pdf")
         uploaded.save(input_pdf)
@@ -162,7 +206,7 @@ def generate_report():
 
         client_name = result["data"].get("client_name", "Client")
         warnings = result.get("warnings", [])
-        safe_name = "".join(c if c.isalnum() or c in " -_" else "_" for c in client_name.replace("&", "and")).strip() or "Client"
+        safe_name = "".join(c if c.isalnum() or c in " -_." else "_" for c in client_name.replace("&", "and")).strip() or "Client"
         download_name = f"{safe_name}_Simplified_Review.pdf"
 
         # Read the file into memory before the temp directory is cleaned up
@@ -171,7 +215,6 @@ def generate_report():
         with open(output_pdf, "rb") as f:
             pdf_bytes = f.read()
 
-    import gc, io
     gc.collect()
     resp = send_file(
         io.BytesIO(pdf_bytes),
@@ -180,11 +223,9 @@ def generate_report():
         download_name=download_name,
     )
     if warnings:
-        resp.headers["X-Report-Warnings"] = " | ".join(warnings)
+        resp.headers["X-Report-Warnings"] = header_safe(" | ".join(warnings))
     # HTTP headers are latin-1 only; a name with other characters must not crash the response.
-    import unicodedata
-    ascii_name = unicodedata.normalize("NFKD", client_name).encode("ascii", "ignore").decode("ascii").strip()
-    resp.headers["X-Report-Client"] = ascii_name or "Client"
+    resp.headers["X-Report-Client"] = header_safe(client_name, 200) or "Client"
     return resp
 
 

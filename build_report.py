@@ -13,6 +13,7 @@ Server-side version (merged 10/2026). Combines:
 `build()` returns {"data": ..., "warnings": [...]}.
 """
 import os
+import subprocess
 import sys
 from datetime import datetime
 
@@ -25,7 +26,7 @@ from pypdf import PdfReader, PdfWriter
 from pypdf.generic import RectangleObject
 from copy import deepcopy
 
-from extract_data import extract, build_combined_data, locate_and_crop_performance_chart
+from extract_data import build_combined_data, locate_and_crop_performance_chart
 from make_allocation_chart import (
     build_donut, CATEGORY_COLORS, CATEGORY_ORDER,
     build_breakdown_donut, classification_colors,
@@ -67,7 +68,11 @@ def crop_performance_chart(source_pdf, page_index, crop_box, out_png, workdir, b
     with open(tmp_pdf, "wb") as f:
         writer.write(f)
 
-    os.system(f'pdftoppm -r 300 -png "{tmp_pdf}" "{os.path.join(workdir, "_perf_raw")}"')
+    # Argument list (no shell) with a time limit, so a stuck rasteriser cannot hang the request.
+    subprocess.run(
+        ["pdftoppm", "-r", "300", "-png", tmp_pdf, os.path.join(workdir, "_perf_raw")],
+        check=False, capture_output=True, timeout=120,
+    )
     raw_png = os.path.join(workdir, "_perf_raw-1.png")
     if not os.path.exists(raw_png):
         # Some poppler versions omit the "-1" suffix for a single-page PDF.
@@ -756,7 +761,6 @@ def draw_page1_body(c, data, donut_path, classification_path, level=0):
     def _donut_column(x, image_path, legend_rows, row_h, label_font_size, value_font_size, two_line):
         c.drawImage(image_path, x, donut_top - donut_size, width=donut_size, height=donut_size, mask="auto")
         legend_x = x + donut_size + 16
-        legend_max_w = col_w - donut_size - 16
         legend_block_h = len(legend_rows) * row_h
         legend_y = donut_top - max(0, (donut_size - legend_block_h) / 2) - 12
         for label, swatch, line2 in legend_rows:

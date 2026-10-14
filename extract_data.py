@@ -719,7 +719,7 @@ def locate_and_crop_performance_chart(pdf_path, workdir, dpi=CHART_CROP_DPI):
     subprocess.run(
         ["pdftoppm", "-r", str(dpi), "-png", "-f", str(page_index + 1),
          "-l", str(page_index + 1), pdf_path, png_prefix],
-        check=True, capture_output=True,
+        check=True, capture_output=True, timeout=120,
     )
     # pdftoppm's single-page output filename varies by version/platform --
     # it may be "<prefix>.png", "<prefix>-<page>.png" with no padding, or

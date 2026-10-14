@@ -2,7 +2,6 @@
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-import matplotlib.font_manager as fm
 
 NAVY = "#1B3557"
 GOLD = "#C9A669"
