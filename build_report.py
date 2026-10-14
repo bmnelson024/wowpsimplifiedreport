@@ -141,6 +141,23 @@ def draw_header(c, client_name, period_start, period_end, advisor):
     c.line(0.75 * inch, PAGE_H - 1.22 * inch, PAGE_W - 0.75 * inch, PAGE_H - 1.22 * inch)
 
 
+def display_registration(registration, acct_type):
+    """Orion prints a registration as "<name>-<account type>" ("Deborah Van Tassel
+    Revocable Trust-Trust", "Andy Felton Core-Individual"), and the report shows the
+    type in its own column right beside it. Drop the repeated ending -- only when it
+    is exactly "-<this row's type>" -- so the name reads cleanly. Display only: the
+    grouping/matching still uses Orion's full text."""
+    reg = (registration or "").strip()
+    typ = (acct_type or "").strip()
+    if reg and typ:
+        suffix = "-" + typ
+        if reg.lower().endswith(suffix.lower()):
+            trimmed = reg[: len(reg) - len(suffix)].rstrip(" -")
+            if trimmed:
+                return trimmed
+    return reg
+
+
 def custodial_number(account_number):
     """The custodial account number a sleeved account belongs to, or None if
     this isn't a sleeve. Orion numbers a sleeve as '<custodial number>_<sleeve>'
@@ -213,7 +230,7 @@ def wrap_text(text, font, size, max_width):
     return lines
 
 
-def draw_accounts_section(c, top_y, data):
+def draw_accounts_section(c, top_y, data, font=9.5, line_h=11.0, row_gap=None):
     """Draws the Accounts table with its section bar's top edge at `top_y`
     and returns the y position just below the total row."""
     section_bar(c, 0.75 * inch, top_y - 18, PAGE_W - 1.5 * inch, 18, "ACCOUNTS")
@@ -239,14 +256,15 @@ def draw_accounts_section(c, top_y, data):
     # Verified against a 6-account client (Livingston) without visible
     # crowding; re-check visually if a client ever has more than ~8.
     n_accounts = len(grouped)
-    row_gap = 18 if n_accounts <= 4 else max(9, 18 - 3 * (n_accounts - 4))
+    if row_gap is None:
+        row_gap = 18 if n_accounts <= 4 else max(9, 18 - 3 * (n_accounts - 4))
 
     for g in grouped:
-        name_lines = wrap_text(g["registration"], "Helvetica", 9.5, account_col_w)
+        name_lines = wrap_text(display_registration(g["registration"], g["type"]), "Helvetica", font, account_col_w)
         c.setFillColor(INK)
-        c.setFont("Helvetica", 9.5)
+        c.setFont("Helvetica", font)
         for i, ln in enumerate(name_lines):
-            c.drawString(col_x[0], row_y - i * 11, ln)
+            c.drawString(col_x[0], row_y - i * line_h, ln)
         # A rolled-up custodial account is just one account to the client: no
         # "N accounts combined" note (that is only for same-name plain accounts).
         if g.get("self_directed") or (g["count"] > 1 and not g.get("custodial")):
@@ -254,18 +272,19 @@ def draw_accounts_section(c, top_y, data):
             c.setFont("Helvetica-Oblique" if g.get("self_directed") else "Helvetica", 8)
             sub = ("Self-directed · invested at the client's direction" if g.get("self_directed")
                    else f"{g['count']} accounts combined")
-            c.drawString(col_x[0], row_y - len(name_lines) * 11, sub)
-            extra = 11
+            c.drawString(col_x[0], row_y - len(name_lines) * line_h, sub)
+            extra = line_h
         else:
             extra = 0
         c.setFillColor(SECONDARY_INK)
-        c.setFont("Helvetica", 9.5)
+        c.setFont("Helvetica", font)
         c.drawString(col_x[1], row_y, g["type"])
         c.setFillColor(INK)
-        c.setFont("Helvetica-Bold", 9.5)
+        c.setFont("Helvetica-Bold", font)
         c.drawRightString(PAGE_W - 0.75 * inch, row_y, money(g["value"]))
-        row_y -= (len(name_lines) * 11 + extra + row_gap)
+        row_y -= (len(name_lines) * line_h + extra + row_gap)
 
+    row_y -= max(0, 9 - row_gap)    # keep the usual clearance above the Total rule when the rows are tightened
     c.setStrokeColor(NAVY)
     c.setLineWidth(1)
     c.line(0.75 * inch, row_y + 10, PAGE_W - 0.75 * inch, row_y + 10)
@@ -618,6 +637,184 @@ def fit_holdings_density(data, generated_date, start_page_num=2):
     return 1.0, natural
 
 
+# Page-1 layout levels, loosest first: (name/type/value font, line height, row gap
+# (None = the original size-based rule), donut size in inches, bucket-legend row height).
+# Level 0 is the original layout, so ordinary households are unchanged; a household with
+# many accounts (e.g. 15 registrations) steps down until the Asset Allocation block
+# clears the page footer instead of running off the bottom of the page.
+PAGE1_LEVELS = [
+    (9.5, 11.0, None, 1.55, 38),
+    (9.5, 11.0, 7, 1.55, 38),
+    (9.5, 11.0, 5, 1.55, 36),
+    (9.5, 11.0, 3, 1.55, 34),
+    (9.0, 10.5, 3, 1.50, 32),
+    (9.0, 10.5, 2, 1.45, 30),
+    (8.5, 10.0, 2.5, 1.40, 30),
+    (8.5, 10.0, 1.5, 1.35, 28),
+    (8.0, 9.5, 2, 1.30, 28),
+    (8.0, 9.5, 1, 1.20, 26),
+]
+PAGE1_MIN_BOTTOM = 0.55 * inch + 22   # lowest y the allocation notes may reach (footer sits at 0.55in)
+
+
+def fit_page1_level(data, donut_path, classification_path):
+    """Index into PAGE1_LEVELS: the loosest layout whose Asset Allocation notes still end above
+    the footer (dry run on a _NullCanvas). Falls back to the tightest level."""
+    for k in range(len(PAGE1_LEVELS)):
+        if draw_page1_body(_NullCanvas(), data, donut_path, classification_path, k) >= PAGE1_MIN_BOTTOM:
+            return k
+    return len(PAGE1_LEVELS) - 1
+
+
+def draw_page1_body(c, data, donut_path, classification_path, level=0):
+    """Everything on page 1 between the header and the footer. Returns the lowest y drawn."""
+    acc_font, acc_line_h, acc_gap, donut_in, bucket_row_h = PAGE1_LEVELS[level]
+    act = data["activity"]
+    top = PAGE_H - 1.65 * inch
+    tile_w = (PAGE_W - 1.5 * inch) / 4
+    # When a managed-accounts export is given, Portfolio Return reflects
+    # just the accounts White Oak manages, not the household blend --
+    # otherwise a self-directed account's own results would skew the
+    # figure clients read as "how did our management do." See the
+    # "self-directed accounts" skill note.
+    has_managed = "managed_total_return_pct" in data
+    return_pct = data.get("managed_total_return_pct") if has_managed else data.get("total_return_pct")
+    return_str = f"{'+' if return_pct >= 0 else ''}{return_pct:.2f}%" if return_pct is not None else "–"
+    return_color = (GOOD_GREEN if return_pct >= 0 else colors.HexColor("#B3261E")) if return_pct is not None else INK
+    tiles = [
+        ("Portfolio Value", money(act.get("Ending Market Value w/ Bond Accrual", data["total_value"])),
+         NAVY,
+         f"{'up' if (act.get('Ending Market Value w/ Bond Accrual', data['total_value']) >= act.get('Beginning Market Value', 0)) else 'down'} from "
+         f"{money(act.get('Beginning Market Value', 0))} on {data['period_start']}"),
+        ("Portfolio Return", return_str, return_color,
+         "for managed accounts, this period" if has_managed else "for the period"),
+        ("Change This Period", money_signed(act.get("Market Value Change", 0)),
+         GOOD_GREEN if act.get("Market Value Change", 0) >= 0 else colors.HexColor("#B3261E"), None),
+        ("Income Received", money(act.get("Income", 0)), INK, None),
+    ]
+    for i, (label, value, vcolor, sub) in enumerate(tiles):
+        stat_tile(c, 0.75 * inch + i * tile_w, top, tile_w, label, value, vcolor, sub)
+
+    c.setStrokeColor(RULE)
+    c.setLineWidth(0.75)
+    rule_y = top - 63
+    c.line(0.75 * inch, rule_y, PAGE_W - 0.75 * inch, rule_y)
+
+    # Cash-flow mini-row: Net Cash Flow, Contributions, Distributions --
+    # added per Brian's request to surface contributions/distributions as
+    # their own labeled figures under the main stat tiles, rather than
+    # buried in a single parenthetical sentence.
+    contributions = act.get("Contributions", 0)
+    distributions = act.get("Distributions", 0)
+    net_flow = contributions + distributions
+    flow_tiles = [
+        ("Net Cash Flow", money_signed(net_flow),
+         GOOD_GREEN if net_flow >= 0 else colors.HexColor("#B3261E")),
+        ("Contributions", money(contributions), INK),
+        ("Distributions", money(abs(distributions)), INK),
+    ]
+    # Accounts moved into / out of the household during the period (Orion's "Transfer In/Out").
+    # Without this line, a big transfer makes the starting value, the ending value and "Change
+    # This Period" look like they don't add up. Only shown when there was one.
+    transfers = act.get("Transfer In/Out", 0) or 0
+    if abs(transfers) >= 1:
+        flow_tiles.append(("Transfers In/Out", money_signed(transfers), INK))
+    for i, (label, value, vcolor) in enumerate(flow_tiles):
+        x = 0.75 * inch + i * tile_w
+        c.setFillColor(MUTED)
+        c.setFont("Helvetica", 7.5)
+        c.drawString(x, rule_y - 14, label.upper())
+        c.setFillColor(vcolor)
+        c.setFont("Helvetica-Bold", 11)
+        c.drawString(x, rule_y - 27, value)
+
+    # Accounts section (moved above Asset Allocation per Brian's request)
+    accounts_bottom_y = draw_accounts_section(c, rule_y - 55, data, font=acc_font, line_h=acc_line_h, row_gap=acc_gap)
+
+    # Allocation section -- two columns: the 4-bucket donut (left) and a
+    # further breakdown by Orion's granular classification labels (right,
+    # added per Brian's request), sized to sit side by side under one
+    # shared section bar.
+    section_y = accounts_bottom_y - 32
+    section_h = 20
+    section_bar(c, 0.75 * inch, section_y - section_h, PAGE_W - 1.5 * inch, section_h, "ASSET ALLOCATION")
+
+    col_gap = 24
+    col_w = (PAGE_W - 1.5 * inch - col_gap) / 2
+    col1_x = 0.75 * inch
+    col2_x = col1_x + col_w + col_gap
+
+    subhead_y = section_y - section_h - 16
+    c.setFillColor(MUTED)
+    c.setFont("Helvetica-Bold", 8.5)
+    c.drawString(col1_x, subhead_y, "BY ASSET CLASS")
+    c.drawString(col2_x, subhead_y, "BY CLASSIFICATION")
+
+    donut_top = subhead_y - 14
+    donut_size = donut_in * inch
+
+    def _donut_column(x, image_path, legend_rows, row_h, label_font_size, value_font_size, two_line):
+        c.drawImage(image_path, x, donut_top - donut_size, width=donut_size, height=donut_size, mask="auto")
+        legend_x = x + donut_size + 16
+        legend_max_w = col_w - donut_size - 16
+        legend_block_h = len(legend_rows) * row_h
+        legend_y = donut_top - max(0, (donut_size - legend_block_h) / 2) - 12
+        for label, swatch, line2 in legend_rows:
+            c.setFillColor(colors.HexColor(swatch))
+            c.rect(legend_x, legend_y - 9, 9, 9, stroke=0, fill=1)
+            c.setFillColor(INK)
+            c.setFont("Helvetica-Bold", label_font_size)
+            c.drawString(legend_x + 14, legend_y - 8, label)
+            if two_line:
+                c.setFillColor(SECONDARY_INK)
+                c.setFont("Helvetica", value_font_size)
+                c.drawString(legend_x + 14, legend_y - 8 - (label_font_size + 2), line2)
+            else:
+                c.setFillColor(SECONDARY_INK)
+                c.setFont("Helvetica", value_font_size)
+                c.drawRightString(x + col_w, legend_y - 8, line2)
+            legend_y -= row_h
+        return min(donut_top - donut_size, legend_y)
+
+    # Left: 4-bucket donut
+    bucket_rows = []
+    for cat in CATEGORY_ORDER:
+        val = data["allocation_buckets"].get(cat, 0)
+        if val <= 0:
+            continue
+        pct = 100 * val / data["total_value"]
+        bucket_rows.append((cat, CATEGORY_COLORS[cat], f"{money(val)} · {pct:.1f}%"))
+    col1_bottom = _donut_column(col1_x, donut_path, bucket_rows, row_h=bucket_row_h,
+                                 label_font_size=9.5, value_font_size=8, two_line=True)
+
+    # Right: further breakdown by granular classification (Large Cap, Mid
+    # Cap, High Yield Bond, etc.), colored as shades of the bucket they
+    # belong to via classification_colors().
+    breakdown = data.get("allocation_breakdown", [])
+    class_colors = classification_colors(breakdown)
+    class_rows = [
+        (r["label"], class_colors[i], f"{r['pct']:.1f}%")
+        for i, r in enumerate(breakdown)
+    ]
+    col2_bottom = _donut_column(col2_x, classification_path, class_rows, row_h=15.5,
+                                 label_font_size=8, value_font_size=8, two_line=False)
+
+    note_y = min(col1_bottom, col2_bottom) - 16
+    c.setFillColor(MUTED)
+    c.setFont("Helvetica-Oblique", 8)
+    note1_lines = wrap_text(
+        "Equities, fixed income, and cash balances are rolled up from individual holdings across all accounts.",
+        "Helvetica-Oblique", 8, col_w)
+    note2_lines = wrap_text(
+        "Shows the largest classifications; smaller ones are grouped as Other.",
+        "Helvetica-Oblique", 8, col_w)
+    for i, ln in enumerate(note1_lines):
+        c.drawString(col1_x, note_y - i * 10, ln)
+    for i, ln in enumerate(note2_lines):
+        c.drawString(col2_x, note_y - i * 10, ln)
+    return note_y - 10 * (max(len(note1_lines), len(note2_lines)) - 1) - 8
+
+
 def build(input_pdf, output_pdf, workdir, registration_overrides=None, perf_page_index=None,
           perf_crop_box=None, perf_bottom_trim=None,
           managed_pdf=None, selfdirected_pdfs=None,
@@ -697,6 +894,18 @@ def build(input_pdf, output_pdf, workdir, registration_overrides=None, perf_page
     generated_date = datetime.now().strftime("%m/%d/%Y")
 
     warnings = []
+    # Safety net: the four-bucket split (built from Orion's allocation labels) must agree with the
+    # section totals in Orion's own Portfolio Appraisal. A new/unknown label that lands in the wrong
+    # bucket would otherwise silently skew the asset-allocation donut.
+    appraisal = data.get("appraisal_totals")
+    if appraisal:
+        buckets = data.get("allocation_buckets", {})
+        tol = max(5.0, 0.0005 * (data.get("total_value") or 0))
+        off = [f"{k}: report {buckets.get(k, 0):,.0f} vs Orion {appraisal.get(k, 0):,.0f}"
+               for k in sorted(set(buckets) | set(appraisal)) if abs(buckets.get(k, 0) - appraisal.get(k, 0)) > tol]
+        if off:
+            warnings.append("Asset allocation by class doesn't match Orion's Portfolio Appraisal totals (" + "; ".join(off)
+                            + ") - an Orion allocation label may need mapping.")
     donut_path = os.path.join(workdir, "allocation_donut.png")
     build_donut(data["allocation_buckets"], donut_path, data["total_value"])
 
@@ -738,143 +947,8 @@ def build(input_pdf, output_pdf, workdir, registration_overrides=None, perf_page
     # ---------------------------------------------------------- PAGE 1 ----
     draw_header(c, data["client_name"], data["period_start"], data["period_end"], data["advisor"])
 
-    act = data["activity"]
-    top = PAGE_H - 1.65 * inch
-    tile_w = (PAGE_W - 1.5 * inch) / 4
-    # When a managed-accounts export is given, Portfolio Return reflects
-    # just the accounts White Oak manages, not the household blend --
-    # otherwise a self-directed account's own results would skew the
-    # figure clients read as "how did our management do." See the
-    # "self-directed accounts" skill note.
-    has_managed = "managed_total_return_pct" in data
-    return_pct = data.get("managed_total_return_pct") if has_managed else data.get("total_return_pct")
-    return_str = f"{'+' if return_pct >= 0 else ''}{return_pct:.2f}%" if return_pct is not None else "–"
-    return_color = (GOOD_GREEN if return_pct >= 0 else colors.HexColor("#B3261E")) if return_pct is not None else INK
-    tiles = [
-        ("Portfolio Value", money(act.get("Ending Market Value w/ Bond Accrual", data["total_value"])),
-         NAVY,
-         f"{'up' if act.get('Market Value Change', 0) >= 0 else 'down'} from "
-         f"{money(act.get('Beginning Market Value', 0))} on {data['period_start']}"),
-        ("Portfolio Return", return_str, return_color,
-         "for managed accounts, this period" if has_managed else "for the period"),
-        ("Change This Period", money_signed(act.get("Market Value Change", 0)),
-         GOOD_GREEN if act.get("Market Value Change", 0) >= 0 else colors.HexColor("#B3261E"), None),
-        ("Income Received", money(act.get("Income", 0)), INK, None),
-    ]
-    for i, (label, value, vcolor, sub) in enumerate(tiles):
-        stat_tile(c, 0.75 * inch + i * tile_w, top, tile_w, label, value, vcolor, sub)
-
-    c.setStrokeColor(RULE)
-    c.setLineWidth(0.75)
-    rule_y = top - 63
-    c.line(0.75 * inch, rule_y, PAGE_W - 0.75 * inch, rule_y)
-
-    # Cash-flow mini-row: Net Cash Flow, Contributions, Distributions --
-    # added per Brian's request to surface contributions/distributions as
-    # their own labeled figures under the main stat tiles, rather than
-    # buried in a single parenthetical sentence.
-    contributions = act.get("Contributions", 0)
-    distributions = act.get("Distributions", 0)
-    net_flow = contributions + distributions
-    flow_tiles = [
-        ("Net Cash Flow", money_signed(net_flow),
-         GOOD_GREEN if net_flow >= 0 else colors.HexColor("#B3261E")),
-        ("Contributions", money(contributions), INK),
-        ("Distributions", money(abs(distributions)), INK),
-    ]
-    for i, (label, value, vcolor) in enumerate(flow_tiles):
-        x = 0.75 * inch + i * tile_w
-        c.setFillColor(MUTED)
-        c.setFont("Helvetica", 7.5)
-        c.drawString(x, rule_y - 14, label.upper())
-        c.setFillColor(vcolor)
-        c.setFont("Helvetica-Bold", 11)
-        c.drawString(x, rule_y - 27, value)
-
-    # Accounts section (moved above Asset Allocation per Brian's request)
-    accounts_bottom_y = draw_accounts_section(c, rule_y - 55, data)
-
-    # Allocation section -- two columns: the 4-bucket donut (left) and a
-    # further breakdown by Orion's granular classification labels (right,
-    # added per Brian's request), sized to sit side by side under one
-    # shared section bar.
-    section_y = accounts_bottom_y - 32
-    section_h = 20
-    section_bar(c, 0.75 * inch, section_y - section_h, PAGE_W - 1.5 * inch, section_h, "ASSET ALLOCATION")
-
-    col_gap = 24
-    col_w = (PAGE_W - 1.5 * inch - col_gap) / 2
-    col1_x = 0.75 * inch
-    col2_x = col1_x + col_w + col_gap
-
-    subhead_y = section_y - section_h - 16
-    c.setFillColor(MUTED)
-    c.setFont("Helvetica-Bold", 8.5)
-    c.drawString(col1_x, subhead_y, "BY ASSET CLASS")
-    c.drawString(col2_x, subhead_y, "BY CLASSIFICATION")
-
-    donut_top = subhead_y - 14
-    donut_size = 1.55 * inch
-
-    def _donut_column(x, image_path, legend_rows, row_h, label_font_size, value_font_size, two_line):
-        c.drawImage(image_path, x, donut_top - donut_size, width=donut_size, height=donut_size, mask="auto")
-        legend_x = x + donut_size + 16
-        legend_max_w = col_w - donut_size - 16
-        legend_block_h = len(legend_rows) * row_h
-        legend_y = donut_top - max(0, (donut_size - legend_block_h) / 2) - 12
-        for label, swatch, line2 in legend_rows:
-            c.setFillColor(colors.HexColor(swatch))
-            c.rect(legend_x, legend_y - 9, 9, 9, stroke=0, fill=1)
-            c.setFillColor(INK)
-            c.setFont("Helvetica-Bold", label_font_size)
-            c.drawString(legend_x + 14, legend_y - 8, label)
-            if two_line:
-                c.setFillColor(SECONDARY_INK)
-                c.setFont("Helvetica", value_font_size)
-                c.drawString(legend_x + 14, legend_y - 8 - (label_font_size + 2), line2)
-            else:
-                c.setFillColor(SECONDARY_INK)
-                c.setFont("Helvetica", value_font_size)
-                c.drawRightString(x + col_w, legend_y - 8, line2)
-            legend_y -= row_h
-        return min(donut_top - donut_size, legend_y)
-
-    # Left: 4-bucket donut
-    bucket_rows = []
-    for cat in CATEGORY_ORDER:
-        val = data["allocation_buckets"].get(cat, 0)
-        if val <= 0:
-            continue
-        pct = 100 * val / data["total_value"]
-        bucket_rows.append((cat, CATEGORY_COLORS[cat], f"{money(val)} · {pct:.1f}%"))
-    col1_bottom = _donut_column(col1_x, donut_path, bucket_rows, row_h=38,
-                                 label_font_size=9.5, value_font_size=8, two_line=True)
-
-    # Right: further breakdown by granular classification (Large Cap, Mid
-    # Cap, High Yield Bond, etc.), colored as shades of the bucket they
-    # belong to via classification_colors().
-    breakdown = data.get("allocation_breakdown", [])
-    class_colors = classification_colors(breakdown)
-    class_rows = [
-        (r["label"], class_colors[i], f"{r['pct']:.1f}%")
-        for i, r in enumerate(breakdown)
-    ]
-    col2_bottom = _donut_column(col2_x, classification_path, class_rows, row_h=15.5,
-                                 label_font_size=8, value_font_size=8, two_line=False)
-
-    note_y = min(col1_bottom, col2_bottom) - 16
-    c.setFillColor(MUTED)
-    c.setFont("Helvetica-Oblique", 8)
-    note1_lines = wrap_text(
-        "Equities, fixed income, and cash balances are rolled up from individual holdings across all accounts.",
-        "Helvetica-Oblique", 8, col_w)
-    note2_lines = wrap_text(
-        "Shows the largest classifications; smaller ones are grouped as Other.",
-        "Helvetica-Oblique", 8, col_w)
-    for i, ln in enumerate(note1_lines):
-        c.drawString(col1_x, note_y - i * 10, ln)
-    for i, ln in enumerate(note2_lines):
-        c.drawString(col2_x, note_y - i * 10, ln)
+    page1_level = fit_page1_level(data, donut_path, classification_path)
+    draw_page1_body(c, data, donut_path, classification_path, page1_level)
 
     draw_footer(c, 1, total_pages, generated_date)
     c.showPage()
@@ -908,8 +982,9 @@ def build(input_pdf, output_pdf, workdir, registration_overrides=None, perf_page
     else:
         benchmark_desc = "the S&P 500 and selected benchmark indices"
     scope_desc = "managed accounts" if has_managed else "the household"
-    caption = (f"Cumulative return for {scope_desc}, {data['period_start']} – {data['period_end']}, "
-               f"vs. {benchmark_desc}.")
+    # Orion's chart runs from the start of the account history, not the review period
+    # (the review-period figures are the ones in the row below), so say "since inception".
+    caption = f"Cumulative return since inception for {scope_desc}, vs. {benchmark_desc}."
     # Wrapped: the managed-accounts caption is long enough to run past the
     # right margin as a single line.
     cap_lines = wrap_text(caption, "Helvetica-Oblique", 7.8, PAGE_W - 1.5 * inch)

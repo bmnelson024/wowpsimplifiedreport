@@ -108,6 +108,13 @@ CATEGORY_MAP = {
     "technology": "Equities",
     "preferred stock": "Equities",
     "private equity": "Equities",
+    # Confirmed on the Van Tassel household export by reconciling against Orion's own
+    # Portfolio Appraisal section totals ("Equity Total" / "Bond Total"): the "Energy" and
+    # "Security" sector lines sit in the Equity section, and "Bank Loan" (senior-loan funds)
+    # in the Bond section. Without these they fell through to "Other".
+    "energy": "Equities",
+    "security": "Equities",
+    "bank loan": "Fixed Income",
 }
 
 
@@ -126,8 +133,20 @@ def top_allocation_breakdown(allocation_rows, top_n=7):
     carries its parent bucket (via `categorize`) so a caller can color it
     as a shade of that bucket's color -- ties this chart visually back to
     the 4-bucket Asset Allocation donut it's breaking down further."""
-    rows = sorted(allocation_rows, key=lambda r: r["value"], reverse=True)
-    kept, rest = rows[:top_n], rows[top_n:]
+    # Orion's own catch-all line ("Other*", sometimes "Other") belongs in the single folded-up
+    # "Other" row, not shown as a second, almost identically named legend entry.
+    own_other = [r for r in allocation_rows if r["label"].replace("*", "").strip().lower() == "other"]
+    named = [r for r in allocation_rows if r not in own_other]
+    merged = {}                       # the same label printed twice (e.g. two "Corporate Bond" lines): one legend entry
+    for r in named:
+        k = r["label"].strip().lower()
+        if k in merged:
+            merged[k] = {**merged[k], "value": merged[k]["value"] + r["value"], "pct": merged[k]["pct"] + r["pct"]}
+        else:
+            merged[k] = dict(r)
+    named = list(merged.values())
+    rows = sorted(named, key=lambda r: r["value"], reverse=True)
+    kept, rest = rows[:top_n], rows[top_n:] + own_other
     out = [
         {"label": r["label"], "value": r["value"], "pct": r["pct"], "parent": categorize(r["label"])}
         for r in kept
@@ -140,6 +159,64 @@ def top_allocation_breakdown(allocation_rows, top_n=7):
             "parent": "Other",
         })
     return out
+
+
+def _allocation_continuation_rows(pdf, last_label):
+    """Orion's Allocation Overview table is printed on page 1 and, when it has many
+    classifications (a household with ~20), continues in a narrower table at the top of the
+    next page -- header ["", "Market Value", "Allocation"], rows [label, value, pct], ending in a
+    Total row. The first page's table was all that used to be read, which silently dropped the
+    tail (e.g. $1.1M incl. $826K of money market on the Van Tassel household). Returns
+    (rows, fixed_last_label): rows is a list of {"label","value","pct"}; fixed_last_label is the
+    first page's last label with any wrapped tail ("Corporate" + "Bond") re-attached, or None."""
+    rows, fixed = [], None
+    for pi in (1, 2):
+        if pi >= len(pdf.pages):
+            break
+        for t in pdf.pages[pi].extract_tables():
+            if not t or len(t[0]) != 3 or t[0][0] not in ("", None):
+                continue
+            head = _dedupe_pairs(t[0][1] or "").lower()
+            if "market value" not in head:
+                continue
+            for r in t[1:]:
+                label = _clean_label(r[0] or "")
+                value, pct = r[1], r[2]
+                if _is_header_or_total(label, ["Total:", "Total"]):
+                    return rows, fixed
+                if not value or "$" not in str(value):
+                    if label and not rows and fixed is None and last_label:
+                        fixed = (last_label + " " + label).strip()   # wrapped tail of the previous page's last label
+                    continue
+                rows.append({"label": label, "value": _money(value), "pct": _pct(pct or "0")})
+            return rows, fixed
+    return rows, fixed
+
+
+APPRAISAL_SECTION_BUCKET = {"equity": "Equities", "bond": "Fixed Income", "money market": "Cash & Equivalents",
+                            "cash": "Cash & Equivalents", "alternatives": "Other", "alternative": "Other", "other": "Other"}
+
+
+def extract_appraisal_totals(pdf):
+    """Orion's own market value per Portfolio Appraisal section ("Equity Total:", "Bond Total:",
+    "Money Market Total:", "Alternatives Total:"), mapped to the report's four buckets. This is
+    the authoritative split the label mapping in CATEGORY_MAP is meant to reproduce, so the
+    builder compares the two and warns when they disagree (a new Orion label that fell into the
+    wrong bucket). Returns {bucket: value} or None if poppler/the lines aren't available."""
+    pages = _poppler_pages(pdf)
+    if pages is None:
+        return None
+    perf = _find_section_page(pdf, "Performance")
+    stop = perf if perf is not None else len(pages)
+    pat = re.compile(r"^([A-Za-z ]+?)\s+Total:\s+\$[\d,]+\.\d{2}\s+\$([\d,]+\.\d{2})\s+[\d.]+\s*%")
+    out = {}
+    for i in range(min(stop, len(pages))):
+        for line in pages[i]:
+            m = pat.match(line)
+            if m and m.group(1).strip().lower() in APPRAISAL_SECTION_BUCKET:
+                b = APPRAISAL_SECTION_BUCKET[m.group(1).strip().lower()]
+                out[b] = out.get(b, 0.0) + float(m.group(2).replace(",", ""))
+    return out or None
 
 
 def _page_text(pdf, i):
@@ -802,6 +879,13 @@ def extract(pdf_path):
                 "value": _money(value),
                 "pct": _pct(pct),
             })
+        # A long table continues on the next page (no Total row on this one): read the rest.
+        saw_total = any(len(r) >= 4 and r[1] and _is_header_or_total(_clean_label(r[1]), ["Total:", "Total"]) for r in tables[2])
+        if not saw_total and allocation_rows:
+            more, fixed_label = _allocation_continuation_rows(pdf, allocation_rows[-1]["label"])
+            if fixed_label:
+                allocation_rows[-1]["label"] = fixed_label
+            allocation_rows.extend(more)
         data["allocation_detail"] = allocation_rows
 
         buckets = {}
@@ -841,6 +925,7 @@ def extract(pdf_path):
                 break
         _flush_pages(pdf)
         data["accounts"] = accounts
+        data["appraisal_totals"] = extract_appraisal_totals(pdf)
         data["total_return_pct"] = extract_total_return(pdf)
         _flush_pages(pdf)
         data["top_holdings"] = extract_top_holdings(pdf, top_n=20)
