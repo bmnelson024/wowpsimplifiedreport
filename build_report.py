@@ -12,6 +12,7 @@ Server-side version (merged 10/2026). Combines:
     "Top 10 Holdings by Percentage" section.
 `build()` returns {"data": ..., "warnings": [...]}.
 """
+import logging
 import os
 import re
 import subprocess
@@ -98,7 +99,7 @@ def section_bar(c, x, y, w, h, title):
     c.drawString(x + 10, y + h / 2 - 4, title)
 
 
-def stat_tile(c, x, y, w, label, value, value_color=INK, sub=None, extra=None):
+def stat_tile(c, x, y, w, label, value, value_color=INK, sub=None):
     c.setFillColor(MUTED)
     c.setFont("Helvetica", 8.5)
     c.drawString(x, y, label.upper())
@@ -110,17 +111,6 @@ def stat_tile(c, x, y, w, label, value, value_color=INK, sub=None, extra=None):
         c.setFont("Helvetica", 7.5)
         for i, ln in enumerate(wrap_text(sub, "Helvetica", 7.5, w - 6)[:2]):
             c.drawString(x, y - 33 - i * 9, ln)
-    if extra:
-        # A second, smaller figure under the sub-line: (text, color, caption)
-        text, color, caption = extra
-        n_sub = len(wrap_text(sub, "Helvetica", 7.5, w - 6)[:2]) if sub else 0
-        ey = y - 33 - n_sub * 9 - 4
-        c.setFillColor(color)
-        c.setFont("Helvetica-Bold", 9.5)
-        c.drawString(x, ey, text)
-        c.setFillColor(MUTED)
-        c.setFont("Helvetica", 7.5)
-        c.drawString(x + stringWidth(text + " ", "Helvetica-Bold", 9.5), ey, caption)
 
 
 def draw_header(c, client_name, period_start, period_end, advisor):
@@ -700,26 +690,29 @@ def draw_page1_body(c, data, donut_path, classification_path, level=0):
     return_pct = data.get("managed_total_return_pct") if has_managed else data.get("total_return_pct")
     return_str = f"{'+' if return_pct >= 0 else ''}{return_pct:.2f}%" if return_pct is not None else "–"
     return_color = (GOOD_GREEN if return_pct >= 0 else colors.HexColor("#B3261E")) if return_pct is not None else INK
-    ytd = data.get("ytd")
-    ytd_extra = None
-    if ytd and ytd.get("pct") is not None:
-        ytd_extra = (f"{'+' if ytd['pct'] >= 0 else ''}{ytd['pct']:.2f}%",
-                     GOOD_GREEN if ytd["pct"] >= 0 else colors.HexColor("#B3261E"), ytd["label"])
     tiles = [
         ("Portfolio Value", money(act.get("Ending Market Value w/ Bond Accrual", data["total_value"])),
          NAVY,
          f"{'up' if (act.get('Ending Market Value w/ Bond Accrual', data['total_value']) >= act.get('Beginning Market Value', 0)) else 'down'} from "
          f"{money(act.get('Beginning Market Value', 0))} on {data['period_start']}"),
         ("Portfolio Return", return_str, return_color,
-         "for managed accounts, this period" if has_managed else "for the period", ytd_extra),
-        ("Change This Period", money_signed(act.get("Market Value Change", 0)),
-         GOOD_GREEN if act.get("Market Value Change", 0) >= 0 else colors.HexColor("#B3261E"), None),
-        ("Income Received", money(act.get("Income", 0)), INK, None),
+         "for managed accounts, this period" if has_managed else "for the period"),
     ]
-    for i, tile in enumerate(tiles):
-        label, value, vcolor, sub = tile[:4]
-        stat_tile(c, 0.75 * inch + i * tile_w, top, tile_w, label, value, vcolor, sub,
-                  extra=tile[4] if len(tile) > 4 else None)
+    # Optional second export (see resolve_ytd): the year-to-date return gets its own tile right beside
+    # the period return, and Income Received moves down to the cash-flow row to make room.
+    ytd = data.get("ytd")
+    ytd_shown = bool(ytd and ytd.get("pct") is not None)
+    if ytd_shown:
+        tiles.append(("Year to Date" if ytd.get("label") == "year to date" else "Return",
+                      f"{'+' if ytd['pct'] >= 0 else ''}{ytd['pct']:.2f}%",
+                      GOOD_GREEN if ytd["pct"] >= 0 else colors.HexColor("#B3261E"),
+                      f"{ytd.get('start', '')} \u2013 {ytd.get('end', '')}" if ytd.get("start") else ytd.get("label")))
+    tiles.append(("Change This Period", money_signed(act.get("Market Value Change", 0)),
+                  GOOD_GREEN if act.get("Market Value Change", 0) >= 0 else colors.HexColor("#B3261E"), None))
+    if not ytd_shown:
+        tiles.append(("Income Received", money(act.get("Income", 0)), INK, None))
+    for i, (label, value, vcolor, sub) in enumerate(tiles):
+        stat_tile(c, 0.75 * inch + i * tile_w, top, tile_w, label, value, vcolor, sub)
 
     c.setStrokeColor(RULE)
     c.setLineWidth(0.75)
@@ -745,8 +738,11 @@ def draw_page1_body(c, data, donut_path, classification_path, level=0):
     transfers = act.get("Transfer In/Out", 0) or 0
     if abs(transfers) >= 1:
         flow_tiles.append(("Transfers In/Out", money_signed(transfers), INK))
+    if ytd_shown:
+        flow_tiles.append(("Income Received", money(act.get("Income", 0)), INK))
+    flow_w = tile_w if len(flow_tiles) <= 4 else (PAGE_W - 1.5 * inch) / len(flow_tiles)
     for i, (label, value, vcolor) in enumerate(flow_tiles):
-        x = 0.75 * inch + i * tile_w
+        x = 0.75 * inch + i * flow_w
         c.setFillColor(MUTED)
         c.setFont("Helvetica", 7.5)
         c.drawString(x, rule_y - 14, label.upper())
@@ -840,17 +836,19 @@ def draw_page1_body(c, data, donut_path, classification_path, level=0):
     return note_y - 10 * (max(len(note1_lines), len(note2_lines)) - 1) - 8
 
 
-def other_holdings_note(data, max_names=6):
-    """Names the holdings Orion files outside Equity / Bond / Money Market (the report's "Other"
-    asset class), so they can be classified in Orion and the report re-run. None when there are none."""
+def other_holdings_note(data, max_names=4):
+    """One short, plain sentence naming the holdings Orion files outside Equity / Bond / Money Market
+    (the report's "Other" asset class), so they can be classified in Orion and the report re-run.
+    None when there are none."""
     other = (data.get("holdings_by_category") or {}).get("Other")
     if not other or not other.get("count"):
         return None
     items = other.get("top") or []
-    names = "; ".join(f"{h['security']} (${h['market_value']:,.0f})" for h in items[:max_names])
+    names = ", ".join(h["security"] for h in items[:max_names])
     more = other["count"] - min(len(items), max_names)
-    return (f"{other['count']} holding(s) worth ${other['total_value']:,.0f} are in Orion's \"Other\" asset class - "
-            f"classify them in Orion and re-run: {names}" + (f"; and {more} more" if more > 0 else "") + ".")
+    n = other["count"]
+    return (f"{n} holding{'s' if n != 1 else ''} (${other['total_value']:,.0f}) still unclassified in Orion: "
+            f"{names}" + (f" and {more} more" if more > 0 else "") + ". Classify in Orion and re-run to include them in the allocation.")
 
 
 def reconcile_allocation_buckets(data):
@@ -944,7 +942,7 @@ def resolve_ytd(main, ytd):
         if not same_end:
             warnings.append(f"The year-to-date export ends {ytd.get('period_end')}, not on the report's end date "
                             f"({main.get('period_end')}) - the figure is labeled with its actual dates.")
-    return {"pct": pct, "label": label}, warnings
+    return {"pct": pct, "label": label, "start": ytd.get("period_start"), "end": ytd.get("period_end")}, warnings
 
 
 def build(input_pdf, output_pdf, workdir, registration_overrides=None, perf_page_index=None,
@@ -1043,8 +1041,12 @@ def build(input_pdf, output_pdf, workdir, registration_overrides=None, perf_page
     # section totals (Equity / Bond / Money Market / Alternatives) are what the Holdings page is
     # built from. Keep the two consistent -- see reconcile_allocation_buckets().
     note = reconcile_allocation_buckets(data)
-    if note:
-        warnings.append(note)
+    if note and "may need mapping" in note:
+        warnings.append(note)    # the split could not be reconciled: the donut may be off, worth a look
+    elif note:
+        # How the asset-class split was reconciled is a technical detail, not something to act on:
+        # logged for troubleshooting, kept out of the on-screen messages.
+        logging.getLogger(__name__).info(note)
     other_note = other_holdings_note(data)
     if other_note:
         warnings.append(other_note)
