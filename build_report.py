@@ -13,6 +13,7 @@ Server-side version (merged 10/2026). Combines:
 `build()` returns {"data": ..., "warnings": [...]}.
 """
 import os
+import re
 import subprocess
 import sys
 from datetime import datetime
@@ -26,7 +27,7 @@ from pypdf import PdfReader, PdfWriter
 from pypdf.generic import RectangleObject
 from copy import deepcopy
 
-from extract_data import build_combined_data, locate_and_crop_performance_chart
+from extract_data import extract_ytd, build_combined_data, locate_and_crop_performance_chart
 from make_allocation_chart import (
     build_donut, CATEGORY_COLORS, CATEGORY_ORDER,
     build_breakdown_donut, classification_colors,
@@ -97,7 +98,7 @@ def section_bar(c, x, y, w, h, title):
     c.drawString(x + 10, y + h / 2 - 4, title)
 
 
-def stat_tile(c, x, y, w, label, value, value_color=INK, sub=None):
+def stat_tile(c, x, y, w, label, value, value_color=INK, sub=None, extra=None):
     c.setFillColor(MUTED)
     c.setFont("Helvetica", 8.5)
     c.drawString(x, y, label.upper())
@@ -109,6 +110,17 @@ def stat_tile(c, x, y, w, label, value, value_color=INK, sub=None):
         c.setFont("Helvetica", 7.5)
         for i, ln in enumerate(wrap_text(sub, "Helvetica", 7.5, w - 6)[:2]):
             c.drawString(x, y - 33 - i * 9, ln)
+    if extra:
+        # A second, smaller figure under the sub-line: (text, color, caption)
+        text, color, caption = extra
+        n_sub = len(wrap_text(sub, "Helvetica", 7.5, w - 6)[:2]) if sub else 0
+        ey = y - 33 - n_sub * 9 - 4
+        c.setFillColor(color)
+        c.setFont("Helvetica-Bold", 9.5)
+        c.drawString(x, ey, text)
+        c.setFillColor(MUTED)
+        c.setFont("Helvetica", 7.5)
+        c.drawString(x + stringWidth(text + " ", "Helvetica-Bold", 9.5), ey, caption)
 
 
 def draw_header(c, client_name, period_start, period_end, advisor):
@@ -658,8 +670,10 @@ PAGE1_LEVELS = [
     (8.5, 10.0, 1.5, 1.35, 28),
     (8.0, 9.5, 2, 1.30, 28),
     (8.0, 9.5, 1, 1.20, 26),
+    (7.5, 8.5, 0, 1.00, 22),     # 15-20 accounts (e.g. a family group)
+    (7.0, 8.0, 0, 0.90, 18),
 ]
-PAGE1_MIN_BOTTOM = 0.55 * inch + 22   # lowest y the allocation notes may reach (footer sits at 0.55in)
+PAGE1_MIN_BOTTOM = 0.55 * inch + 12   # lowest y the allocation notes may reach (footer sits at 0.55in; the last note line then ends ~13pt above the footer text)
 
 
 def fit_page1_level(data, donut_path, classification_path):
@@ -686,19 +700,26 @@ def draw_page1_body(c, data, donut_path, classification_path, level=0):
     return_pct = data.get("managed_total_return_pct") if has_managed else data.get("total_return_pct")
     return_str = f"{'+' if return_pct >= 0 else ''}{return_pct:.2f}%" if return_pct is not None else "–"
     return_color = (GOOD_GREEN if return_pct >= 0 else colors.HexColor("#B3261E")) if return_pct is not None else INK
+    ytd = data.get("ytd")
+    ytd_extra = None
+    if ytd and ytd.get("pct") is not None:
+        ytd_extra = (f"{'+' if ytd['pct'] >= 0 else ''}{ytd['pct']:.2f}%",
+                     GOOD_GREEN if ytd["pct"] >= 0 else colors.HexColor("#B3261E"), ytd["label"])
     tiles = [
         ("Portfolio Value", money(act.get("Ending Market Value w/ Bond Accrual", data["total_value"])),
          NAVY,
          f"{'up' if (act.get('Ending Market Value w/ Bond Accrual', data['total_value']) >= act.get('Beginning Market Value', 0)) else 'down'} from "
          f"{money(act.get('Beginning Market Value', 0))} on {data['period_start']}"),
         ("Portfolio Return", return_str, return_color,
-         "for managed accounts, this period" if has_managed else "for the period"),
+         "for managed accounts, this period" if has_managed else "for the period", ytd_extra),
         ("Change This Period", money_signed(act.get("Market Value Change", 0)),
          GOOD_GREEN if act.get("Market Value Change", 0) >= 0 else colors.HexColor("#B3261E"), None),
         ("Income Received", money(act.get("Income", 0)), INK, None),
     ]
-    for i, (label, value, vcolor, sub) in enumerate(tiles):
-        stat_tile(c, 0.75 * inch + i * tile_w, top, tile_w, label, value, vcolor, sub)
+    for i, tile in enumerate(tiles):
+        label, value, vcolor, sub = tile[:4]
+        stat_tile(c, 0.75 * inch + i * tile_w, top, tile_w, label, value, vcolor, sub,
+                  extra=tile[4] if len(tile) > 4 else None)
 
     c.setStrokeColor(RULE)
     c.setLineWidth(0.75)
@@ -858,11 +879,79 @@ def reconcile_allocation_buckets(data):
             + ") - an Orion allocation label may need mapping.")
 
 
+def _us_date(s):
+    try:
+        return datetime.strptime((s or "").strip(), "%m/%d/%Y")
+    except ValueError:
+        return None
+
+
+def resolve_ytd(main, ytd):
+    """Decides whether the second (year-to-date) export can be shown, and how to label it.
+
+    main: the extracted data of the normal export; ytd: extract_ytd() of the second one.
+    Returns (info or None, [warnings]). info = {"pct", "label"}. The figure is withheld
+    (never guessed) when it cannot be read or when the export is for different accounts --
+    a wrong client's return on a client-facing page is worse than no figure.
+
+    "Same accounts" is judged from the numbers, not the title: Orion names a custom group
+    whatever it was saved as ("3 Clients", "6 Registrations"), so the title can differ while
+    the accounts are identical. Two figures must agree when both exports give them: the value
+    on January 1 (the normal export's YTD column vs. the YTD export's starting value) and, if
+    both end on the same date, the ending value. With no numbers to compare, the title decides."""
+    warnings = []
+    pct = ytd.get("total_return_pct")
+    if pct is None:
+        return None, ["Could not read a return from the year-to-date export, so no YTD figure is shown."]
+
+    start, end = _us_date(ytd.get("period_start")), _us_date(ytd.get("period_end"))
+    main_end = _us_date(main.get("period_end"))
+    if start is None or end is None:
+        return None, ["Could not read the period of the year-to-date export, so no YTD figure is shown."]
+    jan1 = start.month == 1 and start.day == 1 and start.year == end.year
+    same_end = main_end is not None and end == main_end
+
+    def close(a, b):
+        return abs(a - b) <= max(1.0, 0.00005 * max(abs(a), abs(b)))
+    agree, differ = [], []
+    main_jan1 = (main.get("activity_ytd") or {}).get("Beginning Market Value")
+    if jan1 and main_jan1 is not None and ytd.get("beginning_value") is not None:
+        (agree if close(main_jan1, ytd["beginning_value"]) else differ).append(
+            f"value on January 1 (${ytd['beginning_value']:,.0f} in the YTD export vs ${main_jan1:,.0f} here)")
+    main_end_val = main.get("total_value")
+    if same_end and main_end_val is not None and ytd.get("ending_value") is not None:
+        (agree if close(main_end_val, ytd["ending_value"]) else differ).append(
+            f"ending value (${ytd['ending_value']:,.0f} in the YTD export vs ${main_end_val:,.0f} here)")
+    if differ:
+        return None, ["The year-to-date export does not match this report's accounts - " + "; ".join(differ)
+                      + ". No YTD figure is shown. Check it was run for the same accounts."]
+    if not agree:
+        def norm(s):
+            return " ".join(re.sub(r"[^a-z0-9 ]+", " ", (s or "").lower()).split())
+        a, b = norm(main.get("orion_client_name") or main.get("client_name")), norm(ytd.get("client_name"))
+        if a and b and a != b and a not in b and b not in a:
+            return None, [f"The year-to-date export is titled \"{ytd.get('client_name')}\" but this report is for "
+                          f"\"{main.get('orion_client_name') or main.get('client_name')}\", and there were no "
+                          f"figures to confirm they are the same accounts - no YTD figure is shown."]
+
+    if jan1 and same_end:
+        label = "year to date"
+    else:
+        label = f"{start.month}/{start.day}/{start.year % 100:02d} - {end.month}/{end.day}/{end.year % 100:02d}"
+        if not jan1:
+            warnings.append(f"The year-to-date export starts {ytd.get('period_start')}, not January 1 - "
+                            f"the figure is labeled with its actual dates.")
+        if not same_end:
+            warnings.append(f"The year-to-date export ends {ytd.get('period_end')}, not on the report's end date "
+                            f"({main.get('period_end')}) - the figure is labeled with its actual dates.")
+    return {"pct": pct, "label": label}, warnings
+
+
 def build(input_pdf, output_pdf, workdir, registration_overrides=None, perf_page_index=None,
           perf_crop_box=None, perf_bottom_trim=None,
           managed_pdf=None, selfdirected_pdfs=None,
           managed_perf_page_index=None, managed_perf_crop_box=None, managed_perf_bottom_trim=0,
-          rmd=None, client_name_override=None):
+          rmd=None, client_name_override=None, ytd_pdf=None):
     """workdir: a directory for this request's intermediate files (charts,
     cropped PDF). Must be unique per concurrent request.
 
@@ -872,6 +961,10 @@ def build(input_pdf, output_pdf, workdir, registration_overrides=None, perf_page
     crop box to override for one client (original point-space method).
 
     Returns {"data": <extracted data dict>, "warnings": [str, ...]}.
+
+    ytd_pdf: optional second Orion export run for January 1 through the report's end
+    date; its total return is shown as "year to date" under Portfolio Return on page 1
+    (see resolve_ytd for the checks). Omit it and no YTD figure is drawn.
 
     client_name_override: optional name to print on the report (header on every
     page) and use for the file name, instead of the name in the Orion export.
@@ -925,6 +1018,7 @@ def build(input_pdf, output_pdf, workdir, registration_overrides=None, perf_page
     # (e.g. "6 Registrations"), which is meaningless to the client -- let the caller
     # supply the real name. Applied after extraction, so nothing that reads the
     # Orion report (benchmark legend etc.) is affected.
+    data["orion_client_name"] = data["client_name"]   # kept for checking a second (YTD) export belongs to the same client
     if client_name_override and client_name_override.strip():
         data["client_name"] = " ".join(client_name_override.split())
     sd_numbers = {n for sd in data.get("self_directed", []) for n in sd.get("account_numbers", [])}
@@ -937,6 +1031,14 @@ def build(input_pdf, output_pdf, workdir, registration_overrides=None, perf_page
     generated_date = datetime.now().strftime("%m/%d/%Y")
 
     warnings = []
+    if ytd_pdf:
+        try:
+            ytd_info, ytd_warnings = resolve_ytd(data, extract_ytd(ytd_pdf))
+        except Exception as ex:  # the YTD figure is optional -- never let it stop the report
+            ytd_info, ytd_warnings = None, [f"The year-to-date export could not be read ({ex}), so no YTD figure is shown."]
+        warnings.extend(ytd_warnings)
+        if ytd_info:
+            data["ytd"] = ytd_info
     # The four-bucket split is built from Orion's allocation LABELS; Orion's Portfolio Appraisal
     # section totals (Equity / Bond / Money Market / Alternatives) are what the Holdings page is
     # built from. Keep the two consistent -- see reconcile_allocation_buckets().
@@ -988,6 +1090,9 @@ def build(input_pdf, output_pdf, workdir, registration_overrides=None, perf_page
     draw_header(c, data["client_name"], data["period_start"], data["period_end"], data["advisor"])
 
     page1_level = fit_page1_level(data, donut_path, classification_path)
+    if draw_page1_body(_NullCanvas(), data, donut_path, classification_path, page1_level) < PAGE1_MIN_BOTTOM:
+        warnings.append("Page 1 is very full (many accounts), so even the tightest layout runs close to the footer - "
+                        "check page 1 before sending.")
     draw_page1_body(c, data, donut_path, classification_path, page1_level)
 
     draw_footer(c, 1, total_pages, generated_date)

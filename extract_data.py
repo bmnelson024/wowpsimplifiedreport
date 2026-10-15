@@ -211,7 +211,8 @@ def extract_appraisal_totals(pdf):
         return None
     perf = _find_section_page(pdf, "Performance")
     stop = perf if perf is not None else len(pages)
-    pat = re.compile(r"^([A-Za-z ]+?)\s+Total:\s+\$[\d,]+\.\d{2}\s+\$([\d,]+\.\d{2})\s+[\d.]+\s*%")
+    # Cost basis is "N/A" on the Alternatives line (no tax lots), a dollar figure on the others.
+    pat = re.compile(r"^([A-Za-z ]+?)\s+Total:\s+(?:\$[\d,]+\.\d{2}|N/A)\s+\$([\d,]+\.\d{2})\s+[\d.]+\s*%")
     out = {}
     for i in range(min(stop, len(pages))):
         for line in pages[i]:
@@ -830,6 +831,38 @@ def _flush_pages(pdf):
             pass
 
 
+def extract_ytd(pdf_path):
+    """Reads just what the report needs from an optional second Orion export that was run
+    for January 1 through the report's end date: who it is for, its period, and its total
+    return % (the same grand-total figure the main export supplies for the review period)."""
+    with pdfplumber.open(pdf_path) as pdf:
+        tables = pdf.pages[0].extract_tables()
+        meta_map = {}
+        if tables:
+            meta_map = {row[0].strip(): row[1] for row in tables[0]
+                        if row and row[0] and len(row) > 1 and row[1]}
+        name = (meta_map.get("Household:") or meta_map.get("Account:") or meta_map.get("Self:") or "").strip()
+        m = re.match(r"(\d+/\d+/\d+)\s*to\s*(\d+/\d+/\d+)", meta_map.get("Period:", "").strip())
+        activity = {}
+        if len(tables) > 1:
+            for row in tables[1]:
+                label = _clean_label(row[0])
+                if not row[0] or label == "" or "Period" in "".join(str(c) for c in row if c):
+                    continue
+                if len(row) >= 2 and row[1] and "$" in str(row[1]):
+                    activity[label] = _money(row[1])
+        out = {
+            "beginning_value": activity.get("Beginning Market Value"),
+            "ending_value": activity.get("Ending Market Value w/ Bond Accrual", activity.get("Ending Market Value")),
+            "client_name": name,
+            "period_start": m.group(1) if m else "",
+            "period_end": m.group(2) if m else "",
+            "total_return_pct": extract_total_return(pdf),
+        }
+        _flush_pages(pdf)
+    return out
+
+
 def extract(pdf_path):
     data = {}
     with pdfplumber.open(pdf_path) as pdf:
@@ -863,6 +896,16 @@ def extract(pdf_path):
             if len(row) >= 2 and row[1] and "$" in str(row[1]):
                 activity[label] = _money(row[1])
         data["activity"] = activity
+        # The same table's "YTD" column (index 3): dollar figures since January 1. Used only to check
+        # that an optional separate year-to-date export is for the same accounts (see resolve_ytd).
+        activity_ytd = {}
+        for row in tables[1]:
+            label = _clean_label(row[0])
+            if not row[0] or label == "" or "Period" in "".join(str(c) for c in row if c):
+                continue
+            if len(row) >= 4 and row[3] and "$" in str(row[3]):
+                activity_ytd[label] = _money(row[3])
+        data["activity_ytd"] = activity_ytd
 
         # Table 2: Allocation Overview -- rows are [None, label, value, pct]
         allocation_rows = []
