@@ -10,6 +10,11 @@ Exposes:
 
                               Optional fields (all backward compatible --
                               omit them for a plain household report):
+                                ytd_pdf            a second export of the same
+                                                   client run for January 1
+                                                   through the report's end
+                                                   date; its return is shown as
+                                                   year to date on page 1
                                 managed_pdf        the "all but self-directed"
                                                    export (one file)
                                 selfdirected_pdfs  one single-account export
@@ -137,6 +142,11 @@ def generate_report():
         return jsonify({"error": "The self-directed split needs both 'managed_pdf' (the all-but-self-directed "
                                  "export) and at least one 'selfdirected_pdfs' file."}), 400
 
+    # Optional: a second Orion export run for January 1 through the report's end date (year-to-date return).
+    ytd_upload = request.files.get("ytd_pdf")
+    if ytd_upload is not None and not ytd_upload.filename:
+        ytd_upload = None
+
     # Optional: the name to print on the report instead of Orion's group name
     # (a custom multi-account export is titled e.g. "6 Registrations").
     client_name_override = " ".join((request.form.get("client_name") or "").split())[:120] or None
@@ -168,7 +178,7 @@ def generate_report():
                                      "required amount of zero or more)."}), 400
 
     # Reject anything that is clearly not a PDF before spending time on it.
-    for f in [uploaded, managed_upload, *sd_uploads]:
+    for f in [uploaded, managed_upload, ytd_upload, *sd_uploads]:
         if f is None:
             continue
         head = f.stream.read(1024)
@@ -184,6 +194,10 @@ def generate_report():
         if managed_upload:
             managed_pdf = os.path.join(workdir, "managed.pdf")
             managed_upload.save(managed_pdf)
+        ytd_pdf = None
+        if ytd_upload:
+            ytd_pdf = os.path.join(workdir, "ytd.pdf")
+            ytd_upload.save(ytd_pdf)
         selfdirected_pdfs = []
         for i, f in enumerate(sd_uploads):
             p = os.path.join(workdir, f"selfdirected_{i}.pdf")
@@ -196,7 +210,8 @@ def generate_report():
                            managed_pdf=managed_pdf,
                            selfdirected_pdfs=selfdirected_pdfs or None,
                            rmd=rmd,
-                           client_name_override=client_name_override)
+                           client_name_override=client_name_override,
+                           ytd_pdf=ytd_pdf)
         except Exception as e:
             app.logger.error("Report generation failed: %s\n%s", e, traceback.format_exc())
             return jsonify({
